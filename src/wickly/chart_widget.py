@@ -129,6 +129,7 @@ class CandlestickWidget(QWidget):
         # interaction
         self._dragging     = False
         self._drag_last_x  = 0
+        self._drag_carry   = 0.0   # fractional bar carry between frames
         self._mouse_pos: QPointF | None = None
 
         # appearance
@@ -1053,10 +1054,12 @@ class CandlestickWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = True
             self._drag_last_x = int(event.position().x())
+            self._drag_carry = 0.0
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
+            self._drag_carry = 0.0
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         pos = event.position()
@@ -1067,13 +1070,17 @@ class CandlestickWidget(QWidget):
             self._drag_last_x = int(pos.x())
             rect = self._chart_rect()
             count = self._view_end - self._view_start + 1
-            idx_shift = int(-dx / (rect.width() / max(count, 1)))
-            new_s = self._view_start + idx_shift
-            new_e = self._view_end + idx_shift
-            if 0 <= new_s and new_e <= self._n - 1:
-                self._view_start = new_s
-                self._view_end = new_e
-                self.rangeChanged.emit(self._view_start, self._view_end)
+            # Accumulate fractional bars so slow drags aren't lost
+            self._drag_carry += -dx / (rect.width() / max(count, 1))
+            idx_shift = int(self._drag_carry)
+            self._drag_carry -= idx_shift
+            if idx_shift != 0:
+                new_s = self._view_start + idx_shift
+                new_e = self._view_end + idx_shift
+                if 0 <= new_s and new_e <= self._n - 1:
+                    self._view_start = new_s
+                    self._view_end = new_e
+                    self.rangeChanged.emit(self._view_start, self._view_end)
 
         self.update()
 
