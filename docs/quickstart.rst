@@ -59,9 +59,22 @@ the widget without blocking:
 Overlay custom data with ``make_addplot``
 -----------------------------------------
 
+Three plot types are supported:
+
+- **``'line'``** — polyline connecting consecutive non-NaN values.
+  Insert ``NaN`` to create gaps / broken segments.
+- **``'scatter'``** — one marker per non-NaN value.  Use ``NaN`` for bars
+  where no marker should appear.
+- **``'segments'``** — one independent diagonal line per bar, drawn from
+  ``y_start`` to ``y_end``.  Pass a 2-column ``pd.DataFrame`` as ``data``.
+  Use ``NaN`` in both columns for bars with no mark.  This is the natural
+  encoding for divergence indicators such as Knoxville Divergence, where a
+  short slanted line is drawn at each detected divergence bar.
+
 .. code-block:: python
 
    import numpy as np
+   import pandas as pd
 
    sma = df["Close"].rolling(20).mean()
    upper = sma + 2 * df["Close"].rolling(20).std()
@@ -76,6 +89,30 @@ Overlay custom data with ``make_addplot``
    ]
 
    wickly.plot(df, type="candle", volume=True, addplot=apds, style="nightclouds")
+
+Broken-line segments (e.g. Knoxville Divergence)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: python
+
+   # Build a 2-column DataFrame: y_start and y_end for each bar.
+   # NaN rows produce no segment (gap).
+   n = len(df)
+   y_start = np.full(n, np.nan)
+   y_end   = np.full(n, np.nan)
+
+   # Mark divergence bars (your detection logic here)
+   for i in divergence_bar_indices:
+       y_start[i] = df["High"].iloc[i] + 0.2   # top of segment
+       y_end[i]   = df["High"].iloc[i] + 0.2   # horizontal → diagonal → your choice
+
+   segments_df = pd.DataFrame({"y_start": y_start, "y_end": y_end}, index=df.index)
+
+   apds = [
+       wickly.make_addplot(segments_df, type="segments", color="#e91e63", width=2.5),
+   ]
+
+   wickly.plot(df, type="candle", addplot=apds)
 
 Save chart to file
 ------------------

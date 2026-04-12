@@ -9,13 +9,14 @@ Usage mirrors mplfinance:
 
 from wickly._version import __version__
 from wickly.plotting import plot
-from wickly.addplot import make_addplot
+from wickly.addplot import make_addplot, make_segments
 from wickly.styles import make_style, available_styles
 
 __all__ = [
     "__version__",
     "plot",
     "make_addplot",
+    "make_segments",
     "make_style",
     "available_styles",
 ]

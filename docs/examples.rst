@@ -30,11 +30,11 @@ Cycle through all four chart types — ``candle``, ``ohlc``, ``line``,
    :language: python
    :caption: examples/chart_types.py
 
-Addplot overlays (Bollinger Bands)
------------------------------------
+Addplot overlays (Bollinger Bands + Knoxville Divergence)
+----------------------------------------------------------
 
-Overlay Bollinger Bands and scatter-plot buy signals on top of a candlestick
-chart:
+Overlay Bollinger Bands, scatter-plot buy signals, and Knoxville Divergence
+broken-line segments on top of a candlestick chart:
 
 .. code-block:: bash
 
@@ -43,3 +43,4 @@ chart:
 .. literalinclude:: ../examples/addplot_overlay.py
    :language: python
    :caption: examples/addplot_overlay.py
+

@@ -10,7 +10,8 @@
 - 🎯 Crosshair cursor with live OHLC / volume readout
 - 📐 Moving average overlays (`mav` parameter)
 - 🎨 Built-in styles (`default`, `charles`, `mike`, `yahoo`, `classic`, `nightclouds`)
-- 🖼️ `make_addplot()` for overlaying custom data (line & scatter)
+- 🖼️ `make_addplot()` for overlaying custom data (line, scatter & segments)
+- 🔀 `make_segments()` for overlapping broken-line overlays (e.g. Knoxville Divergence)
 - 💾 `savefig()` support (PNG / JPG / BMP)
 - 🔁 `returnfig` mode for embedding in your own PyQt6 application
 - ✅ mplfinance-compatible function signatures
@@ -64,13 +65,28 @@ wickly.plot(df, type='candle', volume=True, mav=(10, 20), style='yahoo', title='
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `data` | Series/list | *required* | Data to overlay |
-| `type` | str | `'line'` | `'line'` or `'scatter'` |
+| `data` | Series/list | *required* | Data to overlay (or list of `(start, values)` tuples for `type='segments'`) |
+| `type` | str | `'line'` | `'line'`, `'scatter'`, or `'segments'` |
 | `color` | str | `None` | Line / marker color |
 | `width` | float | `1.5` | Line width |
 | `scatter` | bool | `False` | *Deprecated* — use `type='scatter'` |
 | `marker` | str | `'o'` | Scatter marker character |
 | `markersize` | float | `50` | Scatter marker size |
+| `ylabel` | str | `None` | Legend label — if set, the overlay appears in the chart legend |
+
+### `wickly.make_segments(segments, **kwargs)`
+
+Convenience wrapper for `make_addplot(type='segments')` — builds an addplot dict
+for multiple independent, possibly overlapping, line segments.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `segments` | list | *required* | List of `(start_index, y_values)` tuples |
+| `color` | str | `None` | Line color |
+| `width` | float | `1.5` | Line width |
+| `alpha` | float | `1.0` | Opacity |
+| `linestyle` | str | `'-'` | `'-'`, `'--'`, `'-.'`, `':'` |
+| `ylabel` | str | `None` | Legend label |
 
 ### `wickly.make_style(**kwargs)`
 
@@ -109,7 +125,7 @@ wickly/
 │   ├── __init__.py      # Public API surface
 │   ├── plotting.py      # Top-level plot() function
 │   ├── chart_widget.py  # PyQt6 CandlestickWidget
-│   ├── addplot.py       # make_addplot() helper
+│   ├── addplot.py       # make_addplot() & make_segments() helpers
 │   ├── styles.py        # Built-in styles & make_style()
 │   └── _utils.py        # Data validation utilities
 ├── tests/               # pytest test suite

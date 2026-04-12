@@ -14,6 +14,8 @@ Top-level functions
 
 .. autofunction:: wickly.make_addplot
 
+.. autofunction:: wickly.make_segments
+
 .. autofunction:: wickly.make_style
 
 .. autofunction:: wickly.available_styles
@@ -48,6 +50,8 @@ Addplot module
 .. module:: wickly.addplot
 
 .. autofunction:: wickly.addplot.make_addplot
+
+.. autofunction:: wickly.addplot.make_segments
 
 ----
 

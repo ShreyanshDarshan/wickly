@@ -110,3 +110,35 @@ class TestPlotReturnfig:
         assert os.path.exists(path)
         _safe_close(widget)
 
+    def test_legend_with_mav(self):
+        """MAVs should automatically appear in the legend."""
+        df = _sample_df()
+        result = wickly.plot(df, type="candle", mav=(5, 10), returnfig=True)
+        assert result is not None
+        widget, _ = result
+        # Widget should have stored MAV data for both periods
+        assert len(widget._mavs) == 2
+        _safe_close(widget)
+
+    def test_legend_with_labelled_addplot(self):
+        """Addplots with ylabel= should appear in the legend."""
+        df = _sample_df()
+        ap = wickly.make_addplot(
+            df["Close"].rolling(5).mean(), color="blue", ylabel="SMA 5",
+        )
+        result = wickly.plot(df, type="candle", addplot=ap, returnfig=True)
+        assert result is not None
+        widget, _ = result
+        assert widget._addplots[0]["ylabel"] == "SMA 5"
+        _safe_close(widget)
+
+    def test_legend_addplot_without_label_excluded(self):
+        """Addplots without ylabel= should not appear in the legend."""
+        df = _sample_df()
+        ap = wickly.make_addplot(df["Close"].rolling(5).mean(), color="red")
+        result = wickly.plot(df, type="candle", addplot=ap, returnfig=True)
+        assert result is not None
+        widget, _ = result
+        assert widget._addplots[0].get("ylabel") is None
+        _safe_close(widget)
+

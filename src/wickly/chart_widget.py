@@ -227,12 +227,26 @@ class CandlestickWidget(QWidget):
         hi = float(np.nanmax(self._highs[s : e + 1]))
         # include addplot data in range
         for ap in self._addplots:
-            ap_data = ap["data"]
-            seg = ap_data[s : e + 1]
-            valid = seg[~np.isnan(seg)]
-            if len(valid):
-                lo = min(lo, float(np.nanmin(valid)))
-                hi = max(hi, float(np.nanmax(valid)))
+            if ap["type"] == "segments":
+                for seg_start, seg_data in ap["data"]:
+                    seg_end = seg_start + len(seg_data)
+                    # clip to visible range
+                    lo_idx = max(s, seg_start)
+                    hi_idx = min(e + 1, seg_end)
+                    if lo_idx >= hi_idx:
+                        continue
+                    seg = seg_data[lo_idx - seg_start : hi_idx - seg_start]
+                    valid = seg[~np.isnan(seg)]
+                    if len(valid):
+                        lo = min(lo, float(np.nanmin(valid)))
+                        hi = max(hi, float(np.nanmax(valid)))
+            else:
+                ap_data = ap["data"]
+                seg = ap_data[s : e + 1]
+                valid = seg[~np.isnan(seg)]
+                if len(valid):
+                    lo = min(lo, float(np.nanmin(valid)))
+                    hi = max(hi, float(np.nanmax(valid)))
         # include MAV data
         for ma in self._mav_data:
             seg = ma[s : e + 1]
@@ -362,6 +376,94 @@ class CandlestickWidget(QWidget):
         if self._mouse_pos is not None:
             self._draw_crosshair(painter, chart_rect, s, e, plo, phi, style)
 
+        # --- legend -------------------------------------------------------------
+        self._draw_legend(painter, chart_rect, style)
+
+    # ---- legend ----
+    def _draw_legend(self, p: QPainter, rect: QRectF, style: dict) -> None:
+        """Draw a compact legend in the top-left of the chart area."""
+        entries: list[tuple[QColor, str, Qt.PenStyle]] = []
+
+        # Collect MAV entries
+        mav_colors = style.get("mavcolors", _MAV_COLORS)
+        for idx, period in enumerate(self._mavs):
+            color_str = mav_colors[idx % len(mav_colors)]
+            entries.append((_qcolor(color_str), f"MA {period}", Qt.PenStyle.SolidLine))
+
+        # Collect addplot entries (only those with a ylabel)
+        for ap in self._addplots:
+            label = ap.get("ylabel")
+            if not label:
+                continue
+            color_str = ap.get("color") or "#1f77b4"
+            ap_alpha = ap.get("alpha", 1.0)
+            color = _qcolor(color_str, ap_alpha)
+            ls_str = ap.get("linestyle", "-")
+            if ls_str in ("--", "dashed"):
+                pen_style = Qt.PenStyle.DashLine
+            elif ls_str in ("-.", "dashdot"):
+                pen_style = Qt.PenStyle.DashDotLine
+            elif ls_str in (":", "dotted"):
+                pen_style = Qt.PenStyle.DotLine
+            else:
+                pen_style = Qt.PenStyle.SolidLine
+            # scatter uses a filled circle swatch; line/segments use a line swatch
+            entries.append((color, label, pen_style))
+
+        if not entries:
+            return
+
+        font = QFont("Segoe UI", 8)
+        p.setFont(font)
+        fm = QFontMetrics(font)
+
+        swatch_w = 18.0  # width of the colour swatch line
+        gap = 6.0        # gap between swatch and text
+        item_gap = 14.0  # gap between consecutive entries
+        pad_x = 8.0      # horizontal padding inside box
+        pad_y = 4.0      # vertical padding inside box
+        row_h = float(fm.height()) + 2.0
+
+        # Compute total box size
+        total_w = pad_x * 2
+        for i, (_, label, _) in enumerate(entries):
+            total_w += swatch_w + gap + fm.horizontalAdvance(label)
+            if i < len(entries) - 1:
+                total_w += item_gap
+        total_h = row_h + pad_y * 2
+
+        # Position: top-left inside chart, below any title
+        box_x = rect.x() + 4
+        box_y = rect.y() + 4
+
+        # Draw background
+        bg_color = _qcolor(style.get("bg_color", "#ffffff"), 0.80)
+        border_color = _qcolor(style.get("grid_color", "#e0e0e0"), 0.60)
+        p.setPen(QPen(border_color, 1))
+        p.setBrush(QBrush(bg_color))
+        p.drawRoundedRect(QRectF(box_x, box_y, total_w, total_h), 4, 4)
+
+        # Draw entries
+        text_color = _qcolor(style.get("text_color", "#333"))
+        cx = box_x + pad_x
+        cy_mid = box_y + pad_y + row_h / 2.0
+
+        for color, label, pen_style in entries:
+            # swatch
+            pen = QPen(color, 2.0)
+            pen.setStyle(pen_style)
+            p.setPen(pen)
+            p.drawLine(
+                QPointF(cx, cy_mid),
+                QPointF(cx + swatch_w, cy_mid),
+            )
+            cx += swatch_w + gap
+
+            # text
+            p.setPen(QPen(text_color))
+            p.drawText(QPointF(cx, cy_mid + fm.ascent() / 2.0 - 1), label)
+            cx += fm.horizontalAdvance(label) + item_gap
+
     # ---- grid ----
     def _draw_grid(self, p: QPainter, rect: QRectF, lo: float, hi: float, style: dict) -> None:
         pen = QPen(_qcolor(style.get("grid_color", "#e0e0e0")), 1, Qt.PenStyle.DotLine)
@@ -489,12 +591,14 @@ class CandlestickWidget(QWidget):
     def _draw_addplots(self, p: QPainter, rect: QRectF, s: int, e: int,
                        lo: float, hi: float) -> None:
         for ap in self._addplots:
-            data = ap["data"]
             color_str = ap.get("color") or "#1f77b4"
             ap_alpha = ap.get("alpha", 1.0)
             color = _qcolor(color_str, ap_alpha)
 
-            if ap["type"] == "scatter":
+            if ap["type"] == "segments":
+                self._draw_segments(p, rect, s, e, lo, hi, ap, color)
+            elif ap["type"] == "scatter":
+                data = ap["data"]
                 marker_size = ap.get("markersize", 50)
                 radius = math.sqrt(marker_size) / 2
                 p.setPen(Qt.PenStyle.NoPen)
@@ -508,6 +612,7 @@ class CandlestickWidget(QWidget):
                     p.drawEllipse(QPointF(x, y), radius, radius)
             else:
                 # line
+                data = ap["data"]
                 lw = ap.get("width", 1.5)
                 pen = QPen(color, lw)
                 ls = ap.get("linestyle", "-")
@@ -531,6 +636,41 @@ class CandlestickWidget(QWidget):
                     if prev is not None:
                         p.drawLine(prev, pt)
                     prev = pt
+
+    def _draw_segments(self, p: QPainter, rect: QRectF, s: int, e: int,
+                       lo: float, hi: float, ap: dict, color: QColor) -> None:
+        """Draw independent (possibly overlapping) line segments."""
+        lw = ap.get("width", 1.5)
+        pen = QPen(color, lw)
+        ls = ap.get("linestyle", "-")
+        if ls in ("--", "dashed"):
+            pen.setStyle(Qt.PenStyle.DashLine)
+        elif ls in ("-.", "dashdot"):
+            pen.setStyle(Qt.PenStyle.DashDotLine)
+        elif ls in (":", "dotted"):
+            pen.setStyle(Qt.PenStyle.DotLine)
+        p.setPen(pen)
+
+        for seg_start, seg_data in ap["data"]:
+            seg_end = seg_start + len(seg_data)
+            # Clip to visible range
+            lo_idx = max(s, seg_start)
+            hi_idx = min(e, seg_end - 1)
+            if lo_idx > hi_idx:
+                continue
+            prev: QPointF | None = None
+            for i in range(lo_idx, hi_idx + 1):
+                val = seg_data[i - seg_start]
+                if np.isnan(val):
+                    prev = None
+                    continue
+                pt = QPointF(
+                    self._x_for_index(i, rect, s, e),
+                    self._y_for_price(val, rect, lo, hi),
+                )
+                if prev is not None:
+                    p.drawLine(prev, pt)
+                prev = pt
 
     # ---- volume ----
     def _draw_volume(self, p: QPainter, rect: QRectF, s: int, e: int,
