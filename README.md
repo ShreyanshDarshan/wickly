@@ -1,4 +1,6 @@
-# Wickly
+![wickly logo](https://github.com/ShreyanshDarshan/wickly/docs/_static/wickly_logo.png)
+
+# wickly
 
 **Interactive candlestick chart plotting with PyQt6** — drop-in replacement for `mplfinance` with rich interactivity.
 

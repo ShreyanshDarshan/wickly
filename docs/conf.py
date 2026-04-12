@@ -11,9 +11,9 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join("..", "src")))
 
 # -- Project information -----------------------------------------------------
-project = "Wickly"
-copyright = "2026, Wickly Contributors"
-author = "Wickly Contributors"
+project = "wickly"
+copyright = "2026, wickly Contributors"
+author = "wickly Contributors"
 
 # The version info for the project
 from wickly._version import __version__
@@ -76,8 +76,9 @@ intersphinx_mapping = {
 # -- Options for HTML output -------------------------------------------------
 html_theme = "furo"
 
-html_title = "Wickly"
-html_short_title = "Wickly"
+html_logo = "_static/wickly_logo.png"
+html_title = "wickly"
+html_short_title = "wickly"
 
 html_theme_options = {
     "light_css_variables": {

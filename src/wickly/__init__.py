@@ -1,5 +1,5 @@
 """
-Wickly — Interactive candlestick chart plotting with PyQt6.
+wickly — Interactive candlestick chart plotting with PyQt6.
 
 Usage mirrors mplfinance:
 

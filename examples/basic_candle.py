@@ -1,5 +1,5 @@
 """
-Example: basic candlestick chart with Wickly.
+Example: basic candlestick chart with wickly.
 
 Run:
     python examples/basic_candle.py
@@ -37,7 +37,7 @@ def main() -> None:
         volume=True,
         mav=(10, 20),
         style="yahoo",
-        title="Wickly — Interactive Candlestick Chart",
+        title="wickly — Interactive Candlestick Chart",
     )
 
 
