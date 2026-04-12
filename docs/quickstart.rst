@@ -121,6 +121,29 @@ Save chart to file
 
    wickly.plot(df, type="candle", savefig="chart.png")
 
+Live / animated charts
+----------------------
+
+Use ``live_plot()`` to open a non-blocking chart that you can feed new data
+to in real time:
+
+.. code-block:: python
+
+   widget, axes = wickly.live_plot(df, type="candle", volume=True, mav=(10, 20))
+
+   # Append a complete new bar
+   widget.append_data(
+       dates=pd.DatetimeIndex([new_date]),
+       opens=np.array([open_]),
+       highs=np.array([high]),
+       lows=np.array([low]),
+       closes=np.array([close]),
+       volumes=np.array([vol]),
+   )
+
+   # Update the last candle in-place (e.g. live tick)
+   widget.update_last(close=latest_price, high=max(old_high, latest_price))
+
 Custom styles
 -------------
 

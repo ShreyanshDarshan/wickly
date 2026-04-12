@@ -12,6 +12,8 @@ Top-level functions
 
 .. autofunction:: wickly.plot
 
+.. autofunction:: wickly.live_plot
+
 .. autofunction:: wickly.make_addplot
 
 .. autofunction:: wickly.make_segments
@@ -28,7 +30,7 @@ Chart widget
 .. module:: wickly.chart_widget
 
 .. autoclass:: wickly.chart_widget.CandlestickWidget
-   :members: set_data, reset_view, save
+   :members: set_data, append_data, update_last, update_addplot, append_addplot_data, update_addplot_last, reset_view, save
    :no-undoc-members:
    :show-inheritance:
    :exclude-members: rangeChanged
@@ -41,6 +43,8 @@ Plotting module
 .. module:: wickly.plotting
 
 .. autofunction:: wickly.plotting.plot
+
+.. autofunction:: wickly.plotting.live_plot
 
 ----
 

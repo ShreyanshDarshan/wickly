@@ -162,3 +162,50 @@ def plot(  # noqa: C901 — intentionally mirrors mplfinance's big kwargs set
         return None
 
     return widget, axes_dict
+
+
+# ---------------------------------------------------------------------------
+# Live / animated chart
+# ---------------------------------------------------------------------------
+
+def live_plot(
+    data: pd.DataFrame,
+    **kwargs: Any,
+) -> tuple[CandlestickWidget, dict[str, Any]]:
+    """Create a non-blocking chart that can be updated with new data.
+
+    Works exactly like ``plot(returnfig=True, block=False)`` but is more
+    explicit about its intent: the returned widget is designed to be fed
+    new bars via :meth:`~wickly.chart_widget.CandlestickWidget.append_data`
+    or updated in-place via
+    :meth:`~wickly.chart_widget.CandlestickWidget.update_last`.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Initial OHLCV DataFrame.
+    **kwargs
+        All keyword arguments accepted by :func:`plot` **except**
+        ``returnfig`` and ``block`` (which are forced to ``True`` / ``False``).
+
+    Returns
+    -------
+    (CandlestickWidget, dict)
+        The live widget and an axes dict.
+
+    Examples
+    --------
+    >>> widget, axes = wickly.live_plot(df, type='candle', volume=True)
+    >>> # later, when a new bar arrives:
+    >>> widget.append_data(new_dates, new_opens, new_highs,
+    ...                    new_lows, new_closes)
+    >>> # or update the last candle in real time:
+    >>> widget.update_last(close=new_price,
+    ...                    high=max(old_high, new_price))
+    """
+    kwargs["returnfig"] = True
+    kwargs["block"] = False
+    result = plot(data, **kwargs)
+    # plot() always returns a tuple when returnfig=True
+    assert result is not None
+    return result

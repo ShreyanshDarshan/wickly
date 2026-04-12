@@ -14,6 +14,7 @@
 - 🔀 `make_segments()` for overlapping broken-line overlays (e.g. Knoxville Divergence)
 - 💾 `savefig()` support (PNG / JPG / BMP)
 - 🔁 `returnfig` mode for embedding in your own PyQt6 application
+- 🔴 `live_plot()` for animated / live-updating charts
 - ✅ mplfinance-compatible function signatures
 
 ## Installation
@@ -60,6 +61,27 @@ wickly.plot(df, type='candle', volume=True, mav=(10, 20), style='yahoo', title='
 | `addplot` | dict/list | `None` | Additional plots (see `make_addplot`) |
 | `columns` | tuple | `("Open","High","Low","Close","Volume")` | Column name mapping |
 | `block` | bool | `True` | Block until window is closed |
+
+### `wickly.live_plot(data, **kwargs)`
+
+Opens a non-blocking chart designed for animated / live updates. Accepts
+the same keyword arguments as `plot()` (except `returnfig` and `block`,
+which are forced to `True` / `False`). Returns `(widget, axes_dict)`.
+
+Use the returned widget to push new data:
+
+| Method | Description |
+|--------|-------------|
+| `widget.append_data(dates, opens, highs, lows, closes, volumes)` | Append one or more bars. Auto-scrolls to the right edge. |
+| `widget.update_last(close=..., high=..., low=..., open_=..., volume=...)` | Update the most recent bar in-place (live tick). |
+
+```python
+widget, axes = wickly.live_plot(df, type='candle', volume=True)
+# Append a new bar
+widget.append_data(new_dates, opens, highs, lows, closes, volumes)
+# Update the current candle with a live tick
+widget.update_last(close=latest_price)
+```
 
 ### `wickly.make_addplot(data, **kwargs)`
 
@@ -168,6 +190,7 @@ python -m sphinx -b html docs docs/_build/html -W
 python examples/basic_candle.py        # Basic candlestick + volume + MAs
 python examples/chart_types.py         # All four chart types in sequence
 python examples/addplot_overlay.py     # Bollinger Bands & scatter signals
+python examples/live_chart.py          # Live / animated chart demo
 ```
 
 ### 7. Adding a new built-in style

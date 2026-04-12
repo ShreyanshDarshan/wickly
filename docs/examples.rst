@@ -44,3 +44,16 @@ broken-line segments on top of a candlestick chart:
    :language: python
    :caption: examples/addplot_overlay.py
 
+Live / animated chart
+---------------------
+
+Open a live chart and feed it new bars in real time using ``QTimer``:
+
+.. code-block:: bash
+
+   python examples/live_chart.py
+
+.. literalinclude:: ../examples/live_chart.py
+   :language: python
+   :caption: examples/live_chart.py
+

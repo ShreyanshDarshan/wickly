@@ -13,6 +13,7 @@ from PyQt6.QtGui import (
     QWheelEvent, QMouseEvent, QPaintEvent, QResizeEvent, QPixmap,
 )
 from PyQt6.QtWidgets import QWidget, QToolTip
+from PyQt6 import sip
 
 from wickly.styles import _get_style, _MAV_COLORS
 
@@ -136,6 +137,15 @@ class CandlestickWidget(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _safe_update(self) -> None:
+        """Call ``self.update()`` only if the underlying C++ object is alive."""
+        if not sip.isdeleted(self):
+            self.update()
+
+    # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
 
@@ -158,16 +168,235 @@ class CandlestickWidget(QWidget):
         self._n       = len(opens)
         self._view_start = 0
         self._view_end   = max(self._n - 1, 0)
+        self._recompute_mavs()
+        self._safe_update()
+
+    def append_data(
+        self,
+        dates: pd.DatetimeIndex,
+        opens: np.ndarray,
+        highs: np.ndarray,
+        lows: np.ndarray,
+        closes: np.ndarray,
+        volumes: np.ndarray | None = None,
+        *,
+        auto_scroll: bool = True,
+    ) -> None:
+        """Append one or more bars to the chart.
+
+        This is the primary method for building animated / live charts.
+        New data is concatenated to the existing arrays and the view is
+        optionally scrolled so the latest bar is always visible.
+
+        Parameters
+        ----------
+        dates, opens, highs, lows, closes, volumes
+            Array-like data for the new bar(s).  Must all have the same
+            length.
+        auto_scroll : bool
+            If ``True`` (default) the visible window slides so the newest
+            bar is at the right edge.  Set to ``False`` to keep the
+            current pan position.
+        """
+        new_n = len(opens)
+        was_at_end = (self._view_end >= self._n - 2)  # near the right edge
+
+        self._dates  = self._dates.append(dates) if self._dates is not None else dates
+        self._opens  = np.concatenate([self._opens, np.asarray(opens, dtype=float)])
+        self._highs  = np.concatenate([self._highs, np.asarray(highs, dtype=float)])
+        self._lows   = np.concatenate([self._lows, np.asarray(lows, dtype=float)])
+        self._closes = np.concatenate([self._closes, np.asarray(closes, dtype=float)])
+        if volumes is not None and self._volumes is not None:
+            self._volumes = np.concatenate([self._volumes, np.asarray(volumes, dtype=float)])
+        elif volumes is not None:
+            self._volumes = np.asarray(volumes, dtype=float)
+
+        self._n = len(self._opens)
+        self._recompute_mavs()
+
+        if auto_scroll and was_at_end:
+            view_span = self._view_end - self._view_start
+            self._view_end = self._n - 1
+            self._view_start = max(0, self._view_end - view_span)
+
+        self._safe_update()
+
+    def update_last(
+        self,
+        open_: float | None = None,
+        high: float | None = None,
+        low: float | None = None,
+        close: float | None = None,
+        volume: float | None = None,
+    ) -> None:
+        """Update the most recent bar in-place and repaint.
+
+        Use this for live tick updates within an incomplete candle.
+        Only the supplied values are overwritten; pass ``None`` to leave
+        a field unchanged.
+
+        Parameters
+        ----------
+        open_ : float or None
+            New open price.
+        high : float or None
+            New high price.
+        low : float or None
+            New low price.
+        close : float or None
+            New close price.
+        volume : float or None
+            New volume.
+        """
+        if self._n == 0:
+            return
+        idx = self._n - 1
+        if open_ is not None:
+            self._opens[idx] = open_
+        if high is not None:
+            self._highs[idx] = high
+        if low is not None:
+            self._lows[idx] = low
+        if close is not None:
+            self._closes[idx] = close
+        if volume is not None and self._volumes is not None:
+            self._volumes[idx] = volume
+        self._recompute_mavs()
+        self._safe_update()
+
+    # ------------------------------------------------------------------
+    # Live addplot helpers
+    # ------------------------------------------------------------------
+
+    def update_addplot(
+        self,
+        index: int,
+        data: np.ndarray | list | pd.Series,
+    ) -> None:
+        """Replace the data of an existing addplot and repaint.
+
+        Parameters
+        ----------
+        index : int
+            Zero-based index into the list of addplots (in the order they
+            were passed to ``plot()`` / ``live_plot()``).
+        data : array-like
+            New data for the overlay.  For ``type='line'`` or ``'scatter'``
+            this must be a 1-D array-like of the same length as the current
+            OHLCV data.  For ``type='segments'`` pass a list of
+            ``(start_index, values)`` tuples.
+        """
+        if index < 0 or index >= len(self._addplots):
+            raise IndexError(
+                f"addplot index {index} out of range "
+                f"(chart has {len(self._addplots)} addplot(s))"
+            )
+        ap = self._addplots[index]
+        if ap["type"] == "segments":
+            if not isinstance(data, list):
+                raise TypeError(
+                    "For type='segments', data must be a list of "
+                    "(start_index, values) tuples."
+                )
+            segments: list[tuple[int, np.ndarray]] = []
+            for item in data:
+                if not (isinstance(item, (tuple, list)) and len(item) == 2):
+                    raise ValueError(
+                        "Each segment must be a (start_index, values) tuple."
+                    )
+                start, vals = item
+                segments.append((int(start), np.asarray(vals, dtype=float)))
+            ap["data"] = segments
+        else:
+            if isinstance(data, pd.Series):
+                ap["data"] = data.values.astype(float)
+            else:
+                ap["data"] = np.asarray(data, dtype=float)
+        self._safe_update()
+
+    def append_addplot_data(
+        self,
+        index: int,
+        values: np.ndarray | list | pd.Series | float,
+    ) -> None:
+        """Append values to an existing line or scatter addplot.
+
+        Call this alongside :meth:`append_data` to keep an overlay array
+        in sync with the OHLCV data.  For bars where the overlay has no
+        value, pass ``float('nan')``.
+
+        Parameters
+        ----------
+        index : int
+            Zero-based index into the list of addplots.
+        values : float or array-like
+            Value(s) to append.  A single float appends one point;
+            an array-like appends multiple points.
+        """
+        if index < 0 or index >= len(self._addplots):
+            raise IndexError(
+                f"addplot index {index} out of range "
+                f"(chart has {len(self._addplots)} addplot(s))"
+            )
+        ap = self._addplots[index]
+        if ap["type"] == "segments":
+            raise TypeError(
+                "append_addplot_data does not support type='segments'. "
+                "Use update_addplot() to replace the full segment list."
+            )
+        if isinstance(values, (int, float)):
+            new = np.array([float(values)])
+        elif isinstance(values, pd.Series):
+            new = values.values.astype(float)
+        else:
+            new = np.asarray(values, dtype=float)
+        ap["data"] = np.concatenate([ap["data"], new])
+        self._safe_update()
+
+    def update_addplot_last(
+        self,
+        index: int,
+        value: float,
+    ) -> None:
+        """Update the last value of a line/scatter addplot in-place.
+
+        Use this alongside :meth:`update_last` to keep an overlay in
+        sync with live tick updates on the most recent bar.
+
+        Parameters
+        ----------
+        index : int
+            Zero-based index into the list of addplots.
+        value : float
+            New value for the last point.
+        """
+        if index < 0 or index >= len(self._addplots):
+            raise IndexError(
+                f"addplot index {index} out of range "
+                f"(chart has {len(self._addplots)} addplot(s))"
+            )
+        ap = self._addplots[index]
+        if ap["type"] == "segments":
+            raise TypeError(
+                "update_addplot_last does not support type='segments'. "
+                "Use update_addplot() to replace the full segment list."
+            )
+        if len(ap["data"]) == 0:
+            return
+        ap["data"][-1] = float(value)
+        self._safe_update()
+
+    def _recompute_mavs(self) -> None:
+        """Recalculate all moving average arrays from current close data."""
         self._mav_data.clear()
         for period in self._mavs:
             ma = pd.Series(self._closes).rolling(period).mean().values
             self._mav_data.append(ma)
-        self.update()
 
     def reset_view(self) -> None:
         self._view_start = 0
         self._view_end   = max(self._n - 1, 0)
-        self.update()
+        self._safe_update()
 
     def save(self, path: str) -> None:
         """Render the widget to an image file."""
