@@ -130,7 +130,7 @@ Contributions are welcome — bug reports, feature requests, documentation impro
 ### 1. Fork & clone
 
 ```bash
-git clone https://github.com/your-org/wickly.git
+git clone https://github.com/ShreyanshDarshan/wickly.git
 cd wickly
 ```
 

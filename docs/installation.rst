@@ -16,7 +16,7 @@ Clone the repository and install with pip:
 
 .. code-block:: bash
 
-   git clone https://github.com/your-org/wickly.git
+   git clone https://github.com/ShreyanshDarshan/wickly.git
    cd wickly
    pip install .
 
