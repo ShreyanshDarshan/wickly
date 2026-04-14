@@ -128,11 +128,11 @@ class CandlestickWidget(QWidget):
         # --- view state ---------------------------------------------------------
         self._view_start = 0
         self._view_end   = max(n - 1, 0)
+        self._pan_offset = 0.0   # fractional bar offset for smooth panning
 
         # interaction
         self._dragging     = False
-        self._drag_last_x  = 0
-        self._drag_carry   = 0.0   # fractional bar carry between frames
+        self._drag_last_x  = 0.0
         self._mouse_pos: QPointF | None = None
 
         # legend visibility — one bool per series
@@ -182,6 +182,7 @@ class CandlestickWidget(QWidget):
         self._n       = len(opens)
         self._view_start = 0
         self._view_end   = max(self._n - 1, 0)
+        self._pan_offset = 0.0
         self._recompute_mavs()
         self._safe_update()
 
@@ -232,6 +233,7 @@ class CandlestickWidget(QWidget):
             view_span = self._view_end - self._view_start
             self._view_end = self._n - 1
             self._view_start = max(0, self._view_end - view_span)
+            self._pan_offset = 0.0
 
         self._safe_update()
 
@@ -410,6 +412,7 @@ class CandlestickWidget(QWidget):
     def reset_view(self) -> None:
         self._view_start = 0
         self._view_end   = max(self._n - 1, 0)
+        self._pan_offset = 0.0
         self._safe_update()
 
     def set_series_visible(self, kind: str, index: int, visible: bool) -> None:
@@ -555,8 +558,8 @@ class CandlestickWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _visible_range(self) -> tuple[int, int]:
-        s = max(0, self._view_start)
-        e = min(self._n - 1, self._view_end)
+        s = max(0, self._view_start - 1)
+        e = min(self._n - 1, self._view_end + 1)
         return s, e
 
     def _price_range(self, s: int, e: int) -> tuple[float, float]:
@@ -605,17 +608,18 @@ class CandlestickWidget(QWidget):
         return 0.0, mx * 1.15
 
     def _x_for_index(self, idx: int, rect: QRectF, s: int, e: int) -> float:
-        count = e - s + 1
+        count = self._view_end - self._view_start + 1
         if count <= 1:
             return rect.x() + rect.width() / 2
-        return rect.x() + (idx - s) / (count - 1) * rect.width()
+        bar_spacing = rect.width() / (count - 1)
+        return rect.x() + (idx - self._view_start - self._pan_offset) * bar_spacing
 
     def _index_for_x(self, x: float, rect: QRectF, s: int, e: int) -> int:
-        count = e - s + 1
+        count = self._view_end - self._view_start + 1
         if count <= 1:
-            return s
-        ratio = (x - rect.x()) / rect.width()
-        return int(round(s + ratio * (count - 1)))
+            return self._view_start
+        bar_spacing = rect.width() / (count - 1)
+        return int(round(self._view_start + self._pan_offset + (x - rect.x()) / bar_spacing))
 
     def _y_for_price(self, price: float, rect: QRectF, lo: float, hi: float) -> float:
         if hi == lo:
@@ -660,7 +664,7 @@ class CandlestickWidget(QWidget):
 
         main_rect, vol_rect, panel_rects = self._layout_panels()
         plo, phi = self._price_range(s, e)
-        count = e - s + 1
+        count = self._view_end - self._view_start + 1
         cw = self._candle_width(main_rect, count)
 
         style = self._style
@@ -1256,7 +1260,7 @@ class CandlestickWidget(QWidget):
     def _draw_panel_histogram(self, p: QPainter, panel: SubPanel, rect: QRectF,
                               s: int, e: int, lo: float, hi: float,
                               color: QColor) -> None:
-        count = e - s + 1
+        count = self._view_end - self._view_start + 1
         cw = self._candle_width(rect, count)
         zero_y = self._y_for_price(0.0, rect, lo, hi)
         p.setPen(Qt.PenStyle.NoPen)
@@ -1376,19 +1380,32 @@ class CandlestickWidget(QWidget):
     # ------------------------------------------------------------------
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
+        self._pan_offset = 0.0
         delta = event.angleDelta().y()
+        rect = self._chart_rect()
         count = self._view_end - self._view_start + 1
+
+        # Fraction of visible range under the cursor (0 = left edge, 1 = right)
+        mx = event.position().x()
+        anchor = max(0.0, min(1.0, (mx - rect.x()) / rect.width())) if rect.width() > 0 else 0.5
+
         zoom_amount = max(1, int(count * 0.1))
 
         if delta > 0:
-            # zoom in
-            self._view_start = min(self._view_start + zoom_amount, self._view_end - 2)
-            self._view_end   = max(self._view_end - zoom_amount, self._view_start + 2)
+            # zoom in — remove bars proportionally around the cursor
+            remove_left  = max(0, int(round(zoom_amount * anchor)))
+            remove_right = max(0, zoom_amount - remove_left)
+            new_s = min(self._view_start + remove_left, self._view_end - 2)
+            new_e = max(self._view_end - remove_right, new_s + 2)
         else:
-            # zoom out
-            self._view_start = max(0, self._view_start - zoom_amount)
-            self._view_end   = min(self._n - 1, self._view_end + zoom_amount)
+            # zoom out — add bars proportionally around the cursor
+            add_left  = max(0, int(round(zoom_amount * anchor)))
+            add_right = max(0, zoom_amount - add_left)
+            new_s = max(0, self._view_start - add_left)
+            new_e = min(self._n - 1, self._view_end + add_right)
 
+        self._view_start = new_s
+        self._view_end   = new_e
         self.rangeChanged.emit(self._view_start, self._view_end)
         self.update()
 
@@ -1410,13 +1427,11 @@ class CandlestickWidget(QWidget):
                     return
             # --- normal drag start ---
             self._dragging = True
-            self._drag_last_x = int(pos.x())
-            self._drag_carry = 0.0
+            self._drag_last_x = pos.x()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
-            self._drag_carry = 0.0
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         pos = event.position()
@@ -1435,21 +1450,29 @@ class CandlestickWidget(QWidget):
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
         if self._dragging:
-            dx = int(pos.x()) - self._drag_last_x
-            self._drag_last_x = int(pos.x())
+            dx = pos.x() - self._drag_last_x
+            self._drag_last_x = pos.x()
             rect = self._chart_rect()
             count = self._view_end - self._view_start + 1
-            # Accumulate fractional bars so slow drags aren't lost
-            self._drag_carry += -dx / (rect.width() / max(count, 1))
-            idx_shift = int(self._drag_carry)
-            self._drag_carry -= idx_shift
-            if idx_shift != 0:
-                new_s = self._view_start + idx_shift
-                new_e = self._view_end + idx_shift
-                if 0 <= new_s and new_e <= self._n - 1:
-                    self._view_start = new_s
-                    self._view_end = new_e
-                    self.rangeChanged.emit(self._view_start, self._view_end)
+            bar_spacing = rect.width() / max(count - 1, 1)
+            self._pan_offset += -dx / bar_spacing
+
+            # Shift view by whole bars when offset accumulates
+            int_shift = int(self._pan_offset)
+            if int_shift != 0:
+                span = self._view_end - self._view_start
+                new_s = max(0, min(self._view_start + int_shift, self._n - 1 - span))
+                actual_shift = new_s - self._view_start
+                self._view_start = new_s
+                self._view_end = new_s + span
+                self._pan_offset -= actual_shift
+                self.rangeChanged.emit(self._view_start, self._view_end)
+
+            # Clamp offset at data boundaries
+            if self._view_start == 0:
+                self._pan_offset = max(0.0, self._pan_offset)
+            if self._view_end >= self._n - 1:
+                self._pan_offset = min(0.0, self._pan_offset)
 
         self.update()
 
