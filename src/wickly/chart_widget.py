@@ -132,6 +132,16 @@ class CandlestickWidget(QWidget):
         self._drag_carry   = 0.0   # fractional bar carry between frames
         self._mouse_pos: QPointF | None = None
 
+        # legend visibility — one bool per series
+        self._mav_visible:     list[bool] = [True] * len(self._mavs)
+        self._addplot_visible: list[bool] = [True] * len(self._addplots)
+        self._volume_visible:  bool = True
+
+        # legend interaction state (rebuilt each paint)
+        self._legend_hover_idx:  int | None = None
+        self._legend_hit_areas:  list[tuple[QRectF, QRectF, str, int]] = []
+        self._legend_rect:       QRectF | None = None
+
         # appearance
         self.setMouseTracking(True)
         self.setMinimumSize(480, 320)
@@ -399,6 +409,28 @@ class CandlestickWidget(QWidget):
         self._view_end   = max(self._n - 1, 0)
         self._safe_update()
 
+    def set_series_visible(self, kind: str, index: int, visible: bool) -> None:
+        """Programmatically toggle the visibility of an overlay series.
+
+        Parameters
+        ----------
+        kind : {'mav', 'addplot', 'volume'}
+            Which series to address.
+        index : int
+            Zero-based index within that series list (ignored for ``'volume'``).
+        visible : bool
+            ``True`` to show, ``False`` to hide.
+        """
+        if kind == "mav":
+            self._mav_visible[index] = visible
+        elif kind == "addplot":
+            self._addplot_visible[index] = visible
+        elif kind == "volume":
+            self._volume_visible = visible
+        else:
+            raise ValueError(f"Unknown kind {kind!r}. Use 'mav', 'addplot', or 'volume'.")
+        self._safe_update()
+
     def save(self, path: str) -> None:
         """Render the widget to an image file."""
         pixmap = QPixmap(self.size())
@@ -418,7 +450,7 @@ class CandlestickWidget(QWidget):
         w = self.width()
         h = self.height()
         usable_h = h - self.MARGIN_TOP - self.MARGIN_BOTTOM
-        if self._show_volume:
+        if self._show_volume and self._volume_visible:
             chart_h = usable_h * (1.0 - self.VOLUME_RATIO)
         else:
             chart_h = usable_h
@@ -455,8 +487,10 @@ class CandlestickWidget(QWidget):
     def _price_range(self, s: int, e: int) -> tuple[float, float]:
         lo = float(np.nanmin(self._lows[s : e + 1]))
         hi = float(np.nanmax(self._highs[s : e + 1]))
-        # include addplot data in range
-        for ap in self._addplots:
+        # include visible addplot data in range
+        for ap_idx, ap in enumerate(self._addplots):
+            if not self._addplot_visible[ap_idx]:
+                continue
             if ap["type"] == "segments":
                 for seg_start, seg_data in ap["data"]:
                     seg_end = seg_start + len(seg_data)
@@ -477,8 +511,10 @@ class CandlestickWidget(QWidget):
                 if len(valid):
                     lo = min(lo, float(np.nanmin(valid)))
                     hi = max(hi, float(np.nanmax(valid)))
-        # include MAV data
-        for ma in self._mav_data:
+        # include visible MAV data
+        for mav_idx, ma in enumerate(self._mav_data):
+            if not self._mav_visible[mav_idx]:
+                continue
             seg = ma[s : e + 1]
             valid = seg[~np.isnan(seg)]
             if len(valid):
@@ -587,7 +623,7 @@ class CandlestickWidget(QWidget):
             self._draw_volume_axis(painter, vol_rect, vlo, vhi, style)
 
         # --- date axis ----------------------------------------------------------
-        bottom_rect = self._volume_rect() if self._show_volume else chart_rect
+        bottom_rect = self._volume_rect() if (self._show_volume and self._volume_visible) else chart_rect
         self._draw_date_axis(painter, bottom_rect, s, e, style)
 
         # --- title --------------------------------------------------------------
@@ -610,89 +646,141 @@ class CandlestickWidget(QWidget):
         self._draw_legend(painter, chart_rect, style)
 
     # ---- legend ----
-    def _draw_legend(self, p: QPainter, rect: QRectF, style: dict) -> None:
-        """Draw a compact legend in the top-left of the chart area."""
-        entries: list[tuple[QColor, str, Qt.PenStyle]] = []
 
-        # Collect MAV entries
+    def _draw_eye_icon(self, p: QPainter, cx: float, cy: float,
+                       size: float, open_: bool, color: QColor) -> None:
+        """Draw an open or closed eye icon centred at (cx, cy)."""
+        hw = size * 0.50   # half-width of the outer oval
+        hh = size * 0.30   # half-height of the outer oval
+        p.setPen(QPen(color, 1.2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if open_:
+            p.drawEllipse(QPointF(cx, cy), hw, hh)
+            p.setBrush(QBrush(color))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QPointF(cx, cy), hw * 0.36, hw * 0.36)
+        else:
+            # closed: a flat horizontal line with short downward lash ticks
+            p.setPen(QPen(color, 1.2))
+            p.drawLine(QPointF(cx - hw, cy), QPointF(cx + hw, cy))
+            tick = hh * 0.8
+            for tx in (cx - hw * 0.5, cx, cx + hw * 0.5):
+                p.drawLine(QPointF(tx, cy), QPointF(tx, cy + tick))
+
+    def _draw_legend(self, p: QPainter, rect: QRectF, style: dict) -> None:
+        """Draw a vertical legend with per-series eye-icon visibility toggles."""
+        # --- build entry list: (color, label, pen_style, kind, kind_idx, visible) ---
+        entries: list[tuple[QColor, str, Qt.PenStyle, str, int, bool]] = []
+
         mav_colors = style.get("mavcolors", _MAV_COLORS)
         for idx, period in enumerate(self._mavs):
-            color_str = mav_colors[idx % len(mav_colors)]
-            entries.append((_qcolor(color_str), f"MA {period}", Qt.PenStyle.SolidLine))
+            entries.append((
+                _qcolor(mav_colors[idx % len(mav_colors)]),
+                f"MA {period}",
+                Qt.PenStyle.SolidLine,
+                "mav", idx,
+                self._mav_visible[idx],
+            ))
 
-        # Collect addplot entries (only those with a ylabel)
-        for ap in self._addplots:
+        for ap_idx, ap in enumerate(self._addplots):
             label = ap.get("ylabel")
             if not label:
                 continue
-            color_str = ap.get("color") or "#1f77b4"
-            ap_alpha = ap.get("alpha", 1.0)
-            color = _qcolor(color_str, ap_alpha)
-            ls_str = ap.get("linestyle", "-")
-            if ls_str in ("--", "dashed"):
-                pen_style = Qt.PenStyle.DashLine
-            elif ls_str in ("-.", "dashdot"):
-                pen_style = Qt.PenStyle.DashDotLine
-            elif ls_str in (":", "dotted"):
-                pen_style = Qt.PenStyle.DotLine
+            color = _qcolor(ap.get("color") or "#1f77b4", ap.get("alpha", 1.0))
+            ls = ap.get("linestyle", "-")
+            if ls in ("--", "dashed"):
+                ps = Qt.PenStyle.DashLine
+            elif ls in ("-.", "dashdot"):
+                ps = Qt.PenStyle.DashDotLine
+            elif ls in (":", "dotted"):
+                ps = Qt.PenStyle.DotLine
             else:
-                pen_style = Qt.PenStyle.SolidLine
-            # scatter uses a filled circle swatch; line/segments use a line swatch
-            entries.append((color, label, pen_style))
+                ps = Qt.PenStyle.SolidLine
+            entries.append((color, label, ps, "addplot", ap_idx,
+                            self._addplot_visible[ap_idx]))
+
+        if self._show_volume:
+            vol_color = _qcolor(
+                style.get("volume_up", style.get("up_color", "#26a69a")), 0.7
+            )
+            entries.append((vol_color, "Volume", Qt.PenStyle.SolidLine,
+                            "volume", 0, self._volume_visible))
 
         if not entries:
+            self._legend_rect = None
+            self._legend_hit_areas = []
             return
 
+        # --- layout constants ---------------------------------------------------
         font = QFont("Segoe UI", 8)
         p.setFont(font)
         fm = QFontMetrics(font)
 
-        swatch_w = 18.0  # width of the colour swatch line
-        gap = 6.0        # gap between swatch and text
-        item_gap = 14.0  # gap between consecutive entries
-        pad_x = 8.0      # horizontal padding inside box
-        pad_y = 4.0      # vertical padding inside box
-        row_h = float(fm.height()) + 2.0
+        eye_sz   = 10.0
+        swatch_w = 18.0
+        gap      = 5.0
+        pad_x    = 8.0
+        pad_y    = 5.0
+        row_h    = max(float(fm.height()), eye_sz) + 4.0
+        row_gap  = 2.0
 
-        # Compute total box size
-        total_w = pad_x * 2
-        for i, (_, label, _) in enumerate(entries):
-            total_w += swatch_w + gap + fm.horizontalAdvance(label)
-            if i < len(entries) - 1:
-                total_w += item_gap
-        total_h = row_h + pad_y * 2
+        max_lw  = max(fm.horizontalAdvance(e[1]) for e in entries)
+        total_w = pad_x * 2 + eye_sz + gap + swatch_w + gap + max_lw
+        total_h = pad_y * 2 + len(entries) * row_h + max(0, len(entries) - 1) * row_gap
 
-        # Position: top-left inside chart, below any title
-        box_x = rect.x() + 4
-        box_y = rect.y() + 4
+        box_x = rect.x() + 4.0
+        box_y = rect.y() + 4.0
 
-        # Draw background
-        bg_color = _qcolor(style.get("bg_color", "#ffffff"), 0.80)
-        border_color = _qcolor(style.get("grid_color", "#e0e0e0"), 0.60)
-        p.setPen(QPen(border_color, 1))
-        p.setBrush(QBrush(bg_color))
-        p.drawRoundedRect(QRectF(box_x, box_y, total_w, total_h), 4, 4)
+        # --- background box -----------------------------------------------------
+        p.setPen(QPen(_qcolor(style.get("grid_color", "#e0e0e0"), 0.60), 1))
+        p.setBrush(QBrush(_qcolor(style.get("bg_color", "#ffffff"), 0.88)))
+        legend_rect = QRectF(box_x, box_y, total_w, total_h)
+        p.drawRoundedRect(legend_rect, 4, 4)
+        self._legend_rect      = legend_rect
+        self._legend_hit_areas = []
 
-        # Draw entries
         text_color = _qcolor(style.get("text_color", "#333"))
-        cx = box_x + pad_x
-        cy_mid = box_y + pad_y + row_h / 2.0
+        hover_fill = _qcolor(style.get("text_color", "#333"), 0.07)
 
-        for color, label, pen_style in entries:
-            # swatch
-            pen = QPen(color, 2.0)
+        # --- draw rows ----------------------------------------------------------
+        for row_idx, (color, label, pen_style, kind, kind_idx, visible) in enumerate(entries):
+            row_y = box_y + pad_y + row_idx * (row_h + row_gap)
+            cy    = row_y + row_h / 2.0
+
+            row_rect = QRectF(box_x + 2, row_y, total_w - 4, row_h)
+            eye_rect = QRectF(box_x + pad_x, cy - eye_sz / 2, eye_sz, eye_sz)
+
+            # row hover highlight
+            if row_idx == self._legend_hover_idx:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(hover_fill))
+                p.drawRoundedRect(row_rect, 3, 3)
+
+            cx = box_x + pad_x
+
+            # eye icon
+            eye_c = QColor(text_color)
+            eye_c.setAlphaF(1.0 if visible else 0.30)
+            self._draw_eye_icon(p, cx + eye_sz / 2, cy, eye_sz, visible, eye_c)
+            cx += eye_sz + gap
+
+            # colour swatch (dimmed when hidden)
+            sc = QColor(color)
+            sc.setAlphaF(sc.alphaF() * (1.0 if visible else 0.25))
+            pen = QPen(sc, 2.0)
             pen.setStyle(pen_style)
             p.setPen(pen)
-            p.drawLine(
-                QPointF(cx, cy_mid),
-                QPointF(cx + swatch_w, cy_mid),
-            )
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawLine(QPointF(cx, cy), QPointF(cx + swatch_w, cy))
             cx += swatch_w + gap
 
-            # text
-            p.setPen(QPen(text_color))
-            p.drawText(QPointF(cx, cy_mid + fm.ascent() / 2.0 - 1), label)
-            cx += fm.horizontalAdvance(label) + item_gap
+            # label (dimmed when hidden)
+            lc = QColor(text_color)
+            lc.setAlphaF(1.0 if visible else 0.35)
+            p.setPen(QPen(lc))
+            p.drawText(QPointF(cx, cy + fm.ascent() / 2.0 - 1), label)
+
+            self._legend_hit_areas.append((row_rect, eye_rect, kind, kind_idx))
 
     # ---- grid ----
     def _draw_grid(self, p: QPainter, rect: QRectF, lo: float, hi: float, style: dict) -> None:
@@ -799,6 +887,8 @@ class CandlestickWidget(QWidget):
                    lo: float, hi: float) -> None:
         mav_colors = self._style.get("mavcolors", _MAV_COLORS)
         for idx, ma_data in enumerate(self._mav_data):
+            if not self._mav_visible[idx]:
+                continue
             color = mav_colors[idx % len(mav_colors)]
             pen = QPen(_qcolor(color), 1.4)
             pen.setStyle(Qt.PenStyle.SolidLine)
@@ -820,7 +910,9 @@ class CandlestickWidget(QWidget):
     # ---- addplots ----
     def _draw_addplots(self, p: QPainter, rect: QRectF, s: int, e: int,
                        lo: float, hi: float) -> None:
-        for ap in self._addplots:
+        for ap_idx, ap in enumerate(self._addplots):
+            if not self._addplot_visible[ap_idx]:
+                continue
             color_str = ap.get("color") or "#1f77b4"
             ap_alpha = ap.get("alpha", 1.0)
             color = _qcolor(color_str, ap_alpha)
@@ -905,7 +997,7 @@ class CandlestickWidget(QWidget):
     # ---- volume ----
     def _draw_volume(self, p: QPainter, rect: QRectF, s: int, e: int,
                      vlo: float, vhi: float, cw: float, style: dict, alpha: float) -> None:
-        if self._volumes is None:
+        if self._volumes is None or not self._volume_visible:
             return
         # light separator line
         p.setPen(QPen(_qcolor(style.get("grid_color", "#e0e0e0")), 1))
@@ -942,6 +1034,8 @@ class CandlestickWidget(QWidget):
             p.drawText(QPointF(x_label, y + fm.ascent() / 2), label)
 
     def _draw_volume_axis(self, p: QPainter, rect: QRectF, vlo: float, vhi: float, style: dict) -> None:
+        if not self._volume_visible:
+            return
         text_color = _qcolor(style.get("text_color", "#333"))
         p.setPen(QPen(text_color))
         font = QFont("Segoe UI", 7)
@@ -1052,8 +1146,21 @@ class CandlestickWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position()
+            # --- legend eye-icon click: toggle visibility, suppress drag ---
+            for row_rect, eye_rect, kind, kind_idx in self._legend_hit_areas:
+                if eye_rect.contains(pos):
+                    if kind == "mav":
+                        self._mav_visible[kind_idx] = not self._mav_visible[kind_idx]
+                    elif kind == "addplot":
+                        self._addplot_visible[kind_idx] = not self._addplot_visible[kind_idx]
+                    elif kind == "volume":
+                        self._volume_visible = not self._volume_visible
+                    self.update()
+                    return
+            # --- normal drag start ---
             self._dragging = True
-            self._drag_last_x = int(event.position().x())
+            self._drag_last_x = int(pos.x())
             self._drag_carry = 0.0
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -1064,6 +1171,18 @@ class CandlestickWidget(QWidget):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         pos = event.position()
         self._mouse_pos = pos
+
+        # --- legend hover ---
+        if self._legend_rect is not None and self._legend_rect.contains(pos):
+            self._legend_hover_idx = None
+            for row_idx, (row_rect, eye_rect, kind, kind_idx) in enumerate(self._legend_hit_areas):
+                if row_rect.contains(pos):
+                    self._legend_hover_idx = row_idx
+                    break
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self._legend_hover_idx = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
         if self._dragging:
             dx = int(pos.x()) - self._drag_last_x
@@ -1086,6 +1205,8 @@ class CandlestickWidget(QWidget):
 
     def leaveEvent(self, event: Any) -> None:  # noqa: N802
         self._mouse_pos = None
+        self._legend_hover_idx = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
