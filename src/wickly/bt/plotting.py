@@ -116,15 +116,17 @@ def plot(
                 ind_scatter = bool(getattr(ind, "scatter",
                                            getattr(ind, "_scatter", False)))
 
-                # 2-D indicators (e.g. Bollinger Bands): each column
-                # becomes a separate indicator sharing the same attributes.
+                # 2-D indicators (e.g. Bollinger Bands): shape is
+                # (num_lines, n_bars).  Each row becomes a separate
+                # indicator sharing the same attributes.
                 if arr.ndim == 2:
-                    for col_idx in range(arr.shape[1]):
-                        col = arr[:n_bars, col_idx]
-                        col_name = f"{ind_name}_{col_idx}" if arr.shape[1] > 1 else ind_name
+                    n_lines = arr.shape[0]
+                    for line_idx in range(n_lines):
+                        line = arr[line_idx, :n_bars]
+                        line_name = f"{ind_name}_{line_idx}" if n_lines > 1 else ind_name
                         indicators.append({
-                            "data": col,
-                            "name": col_name,
+                            "data": line,
+                            "name": line_name,
                             "overlay": ind_overlay,
                             "color": ind_color,
                             "scatter": ind_scatter,

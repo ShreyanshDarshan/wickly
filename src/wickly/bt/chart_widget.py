@@ -14,6 +14,29 @@ from wickly.styles import _get_style
 
 
 # ---------------------------------------------------------------------------
+# Colour palette for auto-colouring indicators
+# ---------------------------------------------------------------------------
+
+_INDICATOR_COLORS = [
+    "#1f77b4",  # blue
+    "#ff7f0e",  # orange
+    "#2ca02c",  # green
+    "#d62728",  # red
+    "#9467bd",  # purple
+    "#8c564b",  # brown
+    "#e377c2",  # pink
+    "#7f7f7f",  # grey
+    "#bcbd22",  # olive
+    "#17becf",  # cyan
+    "#aec7e8",  # light blue
+    "#ffbb78",  # light orange
+    "#98df8a",  # light green
+    "#ff9896",  # light red
+    "#c5b0d5",  # light purple
+]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -209,6 +232,7 @@ class BacktestWidget(CandlestickWidget):
                                      panel_type="histogram", height_ratio=0.12))
 
         # Strategy indicators
+        color_idx = 0
         if indicators:
             for ind in indicators:
                 ind_data = np.asarray(ind["data"], dtype=float)
@@ -216,6 +240,13 @@ class BacktestWidget(CandlestickWidget):
                 ind_color = ind.get("color", None)
                 ind_scatter = ind.get("scatter", False)
                 overlay = ind.get("overlay", None)
+
+                # Auto-assign a distinct colour when none was specified
+                if ind_color is None:
+                    ind_color = _INDICATOR_COLORS[
+                        color_idx % len(_INDICATOR_COLORS)
+                    ]
+                    color_idx += 1
 
                 if overlay is None:
                     overlay = _is_overlay(ind_data, closes)
@@ -234,7 +265,7 @@ class BacktestWidget(CandlestickWidget):
                         )]
                         panels.append(make_panel(
                             np.full(n, np.nan), ylabel=ind_name,
-                            color=ind_color or "#1f77b4", height_ratio=0.12,
+                            color=ind_color, height_ratio=0.12,
                             addplot=panel_ap,
                         ))
                     else:
