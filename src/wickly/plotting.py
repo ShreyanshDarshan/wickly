@@ -107,6 +107,15 @@ def plot(  # noqa: C901 — intentionally mirrors mplfinance's big kwargs set
         elif isinstance(addplot_arg, (list, tuple)):
             addplots = list(addplot_arg)
 
+    panels_arg = kwargs.get("panels", None)
+    panels = None
+    if panels_arg is not None:
+        from wickly.addplot import SubPanel as _SubPanel
+        if isinstance(panels_arg, _SubPanel):
+            panels = [panels_arg]
+        else:
+            panels = list(panels_arg)
+
     # --- prepare data ---------------------------------------------------------
     opens, highs, lows, closes, volumes, dates = check_and_prepare_data(data, columns)
 
@@ -130,6 +139,7 @@ def plot(  # noqa: C901 — intentionally mirrors mplfinance's big kwargs set
         title=title,
         ylabel=ylabel,
         addplots=addplots,
+        panels=panels,
     )
     widget.resize(*figsize)
     widget.setWindowTitle(title or "Wickly Chart")

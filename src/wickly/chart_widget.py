@@ -15,6 +15,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import QWidget, QToolTip
 from PyQt6 import sip
 
+from wickly.addplot import SubPanel
 from wickly.styles import _get_style, _MAV_COLORS
 
 
@@ -87,6 +88,7 @@ class CandlestickWidget(QWidget):
         title: str | None = None,
         ylabel: str = "Price",
         addplots: list[dict[str, Any]] | None = None,
+        panels: list[SubPanel] | None = None,
     ):
         super().__init__(parent)
 
@@ -107,6 +109,7 @@ class CandlestickWidget(QWidget):
         self._title       = title
         self._ylabel      = ylabel
         self._addplots    = addplots or []
+        self._sub_panels: list[SubPanel] = list(panels) if panels else []
 
         # moving averages (normalise to tuple)
         if mav is None:
@@ -427,8 +430,40 @@ class CandlestickWidget(QWidget):
             self._addplot_visible[index] = visible
         elif kind == "volume":
             self._volume_visible = visible
+        elif kind == "panel":
+            self._sub_panels[index].visible = visible
         else:
-            raise ValueError(f"Unknown kind {kind!r}. Use 'mav', 'addplot', or 'volume'.")
+            raise ValueError(f"Unknown kind {kind!r}. Use 'mav', 'addplot', 'volume', or 'panel'.")
+        self._safe_update()
+
+    # ------------------------------------------------------------------
+    # Sub-panel public API
+    # ------------------------------------------------------------------
+
+    def add_panel(self, panel: SubPanel) -> int:
+        """Append a sub-panel and return its index."""
+        self._sub_panels.append(panel)
+        self._safe_update()
+        return len(self._sub_panels) - 1
+
+    def remove_panel(self, index: int) -> None:
+        """Remove the sub-panel at *index*."""
+        del self._sub_panels[index]
+        self._safe_update()
+
+    def set_panel_data(self, index: int, data: np.ndarray) -> None:
+        """Replace the data array of sub-panel *index* and repaint."""
+        self._sub_panels[index].data = np.asarray(data, dtype=float)
+        self._safe_update()
+
+    def append_panel_data(self, index: int, value: float) -> None:
+        """Append one scalar value to sub-panel *index* and repaint."""
+        self._sub_panels[index].data = np.append(self._sub_panels[index].data, float(value))
+        self._safe_update()
+
+    def update_panel_last(self, index: int, value: float) -> None:
+        """Update the last element of sub-panel *index* in-place and repaint."""
+        self._sub_panels[index].data[-1] = float(value)
         self._safe_update()
 
     def save(self, path: str) -> None:
@@ -445,35 +480,75 @@ class CandlestickWidget(QWidget):
     # Geometry helpers
     # ------------------------------------------------------------------
 
-    def _chart_rect(self) -> QRectF:
-        """Return the rectangle for the main (OHLC) chart area."""
+    def _layout_panels(self) -> tuple[QRectF, QRectF | None, list[QRectF]]:
+        """Compute rects for the main chart, volume sub-chart, and user sub-panels.
+
+        Returns
+        -------
+        main_rect : QRectF
+            Rectangle for the main OHLCV chart area.
+        vol_rect : QRectF or None
+            Rectangle for the volume sub-chart, or ``None`` if not shown.
+        panel_rects : list[QRectF]
+            One rect per entry in ``_sub_panels`` (zero-height when hidden).
+        """
         w = self.width()
         h = self.height()
         usable_h = h - self.MARGIN_TOP - self.MARGIN_BOTTOM
+        x  = float(self.MARGIN_LEFT)
+        pw = w - self.MARGIN_LEFT - self.MARGIN_RIGHT
+
+        # Effective height ratios (zero when hidden)
+        vol_ratio = self.VOLUME_RATIO if (self._show_volume and self._volume_visible) else 0.0
+        panel_ratios = [
+            p.height_ratio if p.visible else 0.0
+            for p in self._sub_panels
+        ]
+        total_sub = vol_ratio + sum(panel_ratios)
+
+        # Clamp so main chart always gets at least 25 %
+        if total_sub > 0.75:
+            scale = 0.75 / total_sub
+            vol_ratio *= scale
+            panel_ratios = [r * scale for r in panel_ratios]
+            total_sub = 0.75
+
+        main_h = usable_h * (1.0 - total_sub)
+        main_rect = QRectF(x, self.MARGIN_TOP, pw, main_h)
+
+        # Volume
+        y = self.MARGIN_TOP + main_h
         if self._show_volume and self._volume_visible:
-            chart_h = usable_h * (1.0 - self.VOLUME_RATIO)
+            vol_h   = usable_h * vol_ratio
+            vol_rect: QRectF | None = QRectF(x, y, pw, vol_h)
+            y += vol_h
         else:
-            chart_h = usable_h
-        return QRectF(
-            self.MARGIN_LEFT,
-            self.MARGIN_TOP,
-            w - self.MARGIN_LEFT - self.MARGIN_RIGHT,
-            chart_h,
-        )
+            vol_rect = None
+
+        # User sub-panels
+        panel_rects: list[QRectF] = []
+        for i, panel in enumerate(self._sub_panels):
+            if panel.visible:
+                ph = usable_h * panel_ratios[i]
+                panel_rects.append(QRectF(x, y, pw, ph))
+                y += ph
+            else:
+                panel_rects.append(QRectF(x, y, pw, 0.0))
+
+        return main_rect, vol_rect, panel_rects
+
+    def _chart_rect(self) -> QRectF:
+        """Return the rectangle for the main (OHLC) chart area."""
+        return self._layout_panels()[0]
 
     def _volume_rect(self) -> QRectF:
         """Return the rectangle for the volume sub-chart."""
-        w = self.width()
-        h = self.height()
-        usable_h = h - self.MARGIN_TOP - self.MARGIN_BOTTOM
-        chart_h = usable_h * (1.0 - self.VOLUME_RATIO)
-        vol_h   = usable_h * self.VOLUME_RATIO
-        return QRectF(
-            self.MARGIN_LEFT,
-            self.MARGIN_TOP + chart_h,
-            w - self.MARGIN_LEFT - self.MARGIN_RIGHT,
-            vol_h,
-        )
+        vr = self._layout_panels()[1]
+        if vr is None:
+            # Fallback: position below main with zero height
+            mr = self._layout_panels()[0]
+            return QRectF(mr.x(), mr.y() + mr.height(), mr.width(), 0.0)
+        return vr
 
     # ------------------------------------------------------------------
     # Coordinate mapping
@@ -583,47 +658,53 @@ class CandlestickWidget(QWidget):
         if s > e:
             return
 
-        chart_rect = self._chart_rect()
+        main_rect, vol_rect, panel_rects = self._layout_panels()
         plo, phi = self._price_range(s, e)
         count = e - s + 1
-        cw = self._candle_width(chart_rect, count)
+        cw = self._candle_width(main_rect, count)
 
         style = self._style
         alpha = style.get("alpha", 1.0)
 
         # --- grid ---------------------------------------------------------------
-        self._draw_grid(painter, chart_rect, plo, phi, style)
+        self._draw_grid(painter, main_rect, plo, phi, style)
 
         # --- candles / bars / line ----------------------------------------------
         if self._chart_type in ("candle", "candlestick"):
-            self._draw_candles(painter, chart_rect, s, e, plo, phi, cw, style, alpha)
+            self._draw_candles(painter, main_rect, s, e, plo, phi, cw, style, alpha)
         elif self._chart_type in ("ohlc", "ohlc_bars", "bars"):
-            self._draw_ohlc(painter, chart_rect, s, e, plo, phi, cw, style, alpha)
+            self._draw_ohlc(painter, main_rect, s, e, plo, phi, cw, style, alpha)
         elif self._chart_type == "hollow":
-            self._draw_hollow_candles(painter, chart_rect, s, e, plo, phi, cw, style, alpha)
+            self._draw_hollow_candles(painter, main_rect, s, e, plo, phi, cw, style, alpha)
         elif self._chart_type == "line":
-            self._draw_line(painter, chart_rect, s, e, plo, phi, style)
+            self._draw_line(painter, main_rect, s, e, plo, phi, style)
         else:
-            self._draw_candles(painter, chart_rect, s, e, plo, phi, cw, style, alpha)
+            self._draw_candles(painter, main_rect, s, e, plo, phi, cw, style, alpha)
 
         # --- moving averages ----------------------------------------------------
-        self._draw_mavs(painter, chart_rect, s, e, plo, phi)
+        self._draw_mavs(painter, main_rect, s, e, plo, phi)
 
         # --- addplots -----------------------------------------------------------
-        self._draw_addplots(painter, chart_rect, s, e, plo, phi)
+        self._draw_addplots(painter, main_rect, s, e, plo, phi)
 
         # --- price axis (right) -------------------------------------------------
-        self._draw_price_axis(painter, chart_rect, plo, phi, style)
+        self._draw_price_axis(painter, main_rect, plo, phi, style)
 
         # --- volume -------------------------------------------------------------
-        if self._show_volume:
-            vol_rect = self._volume_rect()
+        if self._show_volume and vol_rect is not None:
             vlo, vhi = self._volume_range(s, e)
             self._draw_volume(painter, vol_rect, s, e, vlo, vhi, cw, style, alpha)
             self._draw_volume_axis(painter, vol_rect, vlo, vhi, style)
 
+        # --- user sub-panels ----------------------------------------------------
+        for panel, prect in zip(self._sub_panels, panel_rects):
+            self._draw_sub_panel(painter, panel, prect, s, e)
+
         # --- date axis ----------------------------------------------------------
-        bottom_rect = self._volume_rect() if (self._show_volume and self._volume_visible) else chart_rect
+        all_sub_rects = [
+            r for r in ([vol_rect] + panel_rects) if r is not None and r.height() > 0
+        ]
+        bottom_rect = all_sub_rects[-1] if all_sub_rects else main_rect
         self._draw_date_axis(painter, bottom_rect, s, e, style)
 
         # --- title --------------------------------------------------------------
@@ -633,17 +714,20 @@ class CandlestickWidget(QWidget):
             font.setBold(True)
             painter.setFont(font)
             painter.drawText(
-                QRectF(self.MARGIN_LEFT, 2, chart_rect.width(), self.MARGIN_TOP - 4),
+                QRectF(self.MARGIN_LEFT, 2, main_rect.width(), self.MARGIN_TOP - 4),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 self._title,
             )
 
         # --- crosshair ----------------------------------------------------------
         if self._mouse_pos is not None:
-            self._draw_crosshair(painter, chart_rect, s, e, plo, phi, style)
+            all_rects = [main_rect] + ([vol_rect] if vol_rect else []) + [
+                r for r in panel_rects if r.height() > 0
+            ]
+            self._draw_crosshair(painter, main_rect, all_rects, s, e, plo, phi, style)
 
         # --- legend -------------------------------------------------------------
-        self._draw_legend(painter, chart_rect, style)
+        self._draw_legend(painter, main_rect, style)
 
     # ---- legend ----
 
@@ -705,6 +789,16 @@ class CandlestickWidget(QWidget):
             )
             entries.append((vol_color, "Volume", Qt.PenStyle.SolidLine,
                             "volume", 0, self._volume_visible))
+
+        # Collect sub-panel entries
+        for pi, panel in enumerate(self._sub_panels):
+            entries.append((
+                _qcolor(panel.color, panel.alpha),
+                panel.ylabel,
+                Qt.PenStyle.SolidLine,
+                "panel", pi,
+                panel.visible,
+            ))
 
         if not entries:
             self._legend_rect = None
@@ -1073,21 +1167,175 @@ class CandlestickWidget(QWidget):
             tw = fm.horizontalAdvance(label)
             p.drawText(QPointF(x - tw / 2, y_label), label)
 
+    # ---- sub-panels ----
+
+    def _panel_y_range(self, panel: SubPanel, s: int, e: int) -> tuple[float, float] | None:
+        """Compute the Y range for a sub-panel, or None if all data is NaN."""
+        seg = panel.data[s : e + 1]
+        valid = seg[~np.isnan(seg)]
+        if len(valid) == 0:
+            return None
+        lo = float(np.nanmin(valid))
+        hi = float(np.nanmax(valid))
+        if panel.panel_type == "histogram":
+            lo = min(lo, 0.0)
+        # also include any addplot data on this panel
+        for ap in panel.addplots:
+            if ap["type"] != "segments":
+                ap_seg = ap["data"][s : e + 1]
+                ap_valid = ap_seg[~np.isnan(ap_seg)]
+                if len(ap_valid):
+                    lo = min(lo, float(np.nanmin(ap_valid)))
+                    hi = max(hi, float(np.nanmax(ap_valid)))
+        pad = (hi - lo) * 0.05 if hi != lo else 1.0
+        return lo - pad, hi + pad
+
+    def _draw_sub_panel(self, p: QPainter, panel: SubPanel,
+                        rect: QRectF, s: int, e: int) -> None:
+        """Draw a single sub-panel below the main chart."""
+        if not panel.visible or rect.height() < 1:
+            return
+        yr = self._panel_y_range(panel, s, e)
+        if yr is None:
+            return
+        lo, hi = yr
+
+        style = self._style
+
+        # separator + grid
+        p.setPen(QPen(_qcolor(style.get("grid_color", "#e0e0e0")), 1))
+        p.drawLine(QPointF(rect.x(), rect.y()), QPointF(rect.x() + rect.width(), rect.y()))
+        self._draw_grid(p, rect, lo, hi, style)
+
+        color = _qcolor(panel.color, panel.alpha)
+        if panel.panel_type == "histogram":
+            self._draw_panel_histogram(p, panel, rect, s, e, lo, hi, color)
+        else:
+            self._draw_panel_line(p, panel, rect, s, e, lo, hi, color)
+
+        # overlays on this panel
+        self._draw_addplot_list(p, panel.addplots, rect, s, e, lo, hi)
+
+        # price axis
+        self._draw_price_axis(p, rect, lo, hi, style)
+
+        # ylabel label
+        p.setPen(QPen(_qcolor(style.get("text_color", "#333"), 0.70)))
+        font = QFont("Segoe UI", 7)
+        p.setFont(font)
+        fm = QFontMetrics(font)
+        p.drawText(QPointF(rect.x() + 4, rect.y() + fm.ascent() + 3), panel.ylabel)
+
+    def _draw_panel_line(self, p: QPainter, panel: SubPanel, rect: QRectF,
+                         s: int, e: int, lo: float, hi: float,
+                         color: QColor) -> None:
+        lw = panel.width
+        pen = QPen(color, lw)
+        ls = panel.linestyle
+        if ls in ("--", "dashed"):
+            pen.setStyle(Qt.PenStyle.DashLine)
+        elif ls in ("-.", "dashdot"):
+            pen.setStyle(Qt.PenStyle.DashDotLine)
+        elif ls in (":", "dotted"):
+            pen.setStyle(Qt.PenStyle.DotLine)
+        p.setPen(pen)
+        prev: QPointF | None = None
+        for i in range(s, e + 1):
+            val = panel.data[i] if i < len(panel.data) else float("nan")
+            if np.isnan(val):
+                prev = None
+                continue
+            pt = QPointF(
+                self._x_for_index(i, rect, s, e),
+                self._y_for_price(val, rect, lo, hi),
+            )
+            if prev is not None:
+                p.drawLine(prev, pt)
+            prev = pt
+
+    def _draw_panel_histogram(self, p: QPainter, panel: SubPanel, rect: QRectF,
+                              s: int, e: int, lo: float, hi: float,
+                              color: QColor) -> None:
+        count = e - s + 1
+        cw = self._candle_width(rect, count)
+        zero_y = self._y_for_price(0.0, rect, lo, hi)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(color))
+        for i in range(s, e + 1):
+            val = panel.data[i] if i < len(panel.data) else float("nan")
+            if np.isnan(val):
+                continue
+            x   = self._x_for_index(i, rect, s, e)
+            y   = self._y_for_price(val, rect, lo, hi)
+            top = min(y, zero_y)
+            bh  = max(abs(y - zero_y), 1.0)
+            p.drawRect(QRectF(x - cw / 2, top, cw, bh))
+
+    def _draw_addplot_list(
+        self,
+        p: QPainter,
+        addplots: list[dict[str, Any]],
+        rect: QRectF,
+        s: int,
+        e: int,
+        lo: float,
+        hi: float,
+    ) -> None:
+        """Draw a list of addplot dicts against an arbitrary rect + Y range."""
+        for ap in addplots:
+            color_str = ap.get("color") or "#1f77b4"
+            ap_alpha = ap.get("alpha", 1.0)
+            color = _qcolor(color_str, ap_alpha)
+            lw = ap.get("width", 1.5)
+            pen = QPen(color, lw)
+            ls = ap.get("linestyle", "-")
+            if ls in ("--", "dashed"):
+                pen.setStyle(Qt.PenStyle.DashLine)
+            elif ls in ("-.", "dashdot"):
+                pen.setStyle(Qt.PenStyle.DashDotLine)
+            elif ls in (":", "dotted"):
+                pen.setStyle(Qt.PenStyle.DotLine)
+            p.setPen(pen)
+            prev: QPointF | None = None
+            data = ap["data"]
+            for i in range(s, e + 1):
+                val = data[i] if i < len(data) else float("nan")
+                if np.isnan(val):
+                    prev = None
+                    continue
+                pt = QPointF(
+                    self._x_for_index(i, rect, s, e),
+                    self._y_for_price(val, rect, lo, hi),
+                )
+                if prev is not None:
+                    p.drawLine(prev, pt)
+                prev = pt
+
     # ---- crosshair ----
-    def _draw_crosshair(self, p: QPainter, rect: QRectF, s: int, e: int,
-                        lo: float, hi: float, style: dict) -> None:
+    def _draw_crosshair(
+        self,
+        p: QPainter,
+        rect: QRectF,
+        all_rects: list[QRectF],
+        s: int,
+        e: int,
+        lo: float,
+        hi: float,
+        style: dict,
+    ) -> None:
         mx = self._mouse_pos.x()  # type: ignore[union-attr]
         my = self._mouse_pos.y()  # type: ignore[union-attr]
 
-        # Only draw inside chart area (including volume)
-        full_bottom = (self._volume_rect().y() + self._volume_rect().height()) if self._show_volume else (rect.y() + rect.height())
-        if not (rect.x() <= mx <= rect.x() + rect.width() and rect.y() <= my <= full_bottom):
+        full_top    = all_rects[0].y()
+        full_bottom = all_rects[-1].y() + all_rects[-1].height()
+
+        if not (rect.x() <= mx <= rect.x() + rect.width() and full_top <= my <= full_bottom):
             return
 
         pen = QPen(_qcolor(style.get("text_color", "#333"), 0.4), 1, Qt.PenStyle.DashLine)
         p.setPen(pen)
         p.drawLine(QPointF(rect.x(), my), QPointF(rect.x() + rect.width(), my))
-        p.drawLine(QPointF(mx, rect.y()), QPointF(mx, full_bottom))
+        p.drawLine(QPointF(mx, full_top), QPointF(mx, full_bottom))
 
         # index under cursor
         idx = self._index_for_x(mx, rect, s, e)
@@ -1156,6 +1404,8 @@ class CandlestickWidget(QWidget):
                         self._addplot_visible[kind_idx] = not self._addplot_visible[kind_idx]
                     elif kind == "volume":
                         self._volume_visible = not self._volume_visible
+                    elif kind == "panel":
+                        self._sub_panels[kind_idx].visible = not self._sub_panels[kind_idx].visible
                     self.update()
                     return
             # --- normal drag start ---

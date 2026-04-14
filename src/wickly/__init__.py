@@ -9,7 +9,7 @@ Usage mirrors mplfinance:
 
 from wickly._version import __version__
 from wickly.plotting import plot, live_plot
-from wickly.addplot import make_addplot, make_segments
+from wickly.addplot import make_addplot, make_segments, make_panel, SubPanel
 from wickly.styles import make_style, available_styles
 
 __all__ = [
@@ -18,6 +18,8 @@ __all__ = [
     "live_plot",
     "make_addplot",
     "make_segments",
+    "make_panel",
+    "SubPanel",
     "make_style",
     "available_styles",
 ]

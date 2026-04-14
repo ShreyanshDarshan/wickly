@@ -1,12 +1,61 @@
-"""``make_addplot`` — mplfinance-compatible helper for additional data overlays."""
+"""``make_addplot`` / ``make_panel`` — helpers for chart overlays and sub-panels."""
 
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# SubPanel — data model for a synced sub-chart below the main candle chart
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SubPanel:
+    """Configuration for a synced sub-chart panel below the main chart.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        1-D array of y-values, same length as the OHLCV data.
+    ylabel : str
+        Label displayed at the top-left of the panel and in the legend.
+    height_ratio : float
+        Fraction of the widget's usable height allocated to this panel.
+        Default is ``0.20`` (20 %).  The sum of all sub-panel ratios is
+        clamped to ≤ 0.75 so the main chart always keeps at least 25 %.
+    color : str
+        Line / bar colour (hex or named).
+    panel_type : str
+        ``'line'`` (default) or ``'histogram'`` (bars from zero baseline,
+        suitable for RSI with a zero-line, volume, or momentum).
+    width : float
+        Line or bar outline width.
+    linestyle : str
+        ``'-'``, ``'--'``, ``'-.'``, or ``':'`` (line panels only).
+    alpha : float
+        Opacity 0–1.
+    visible : bool
+        Initial visibility.  Can be toggled via the eye icon in the legend.
+    addplots : list[dict]
+        Optional extra line/scatter overlays on this panel, built with
+        :func:`make_addplot`.  They are drawn in the panel's own Y range.
+    """
+
+    data: np.ndarray
+    ylabel: str = "Value"
+    height_ratio: float = 0.20
+    color: str = "#1f77b4"
+    panel_type: str = "line"   # 'line' | 'histogram'
+    width: float = 1.5
+    linestyle: str = "-"
+    alpha: float = 1.0
+    visible: bool = True
+    addplots: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _normalise_1d(data: pd.Series | pd.DataFrame | list | np.ndarray) -> np.ndarray:
@@ -194,4 +243,90 @@ def make_segments(
         alpha=alpha,
         linestyle=linestyle,
         ylabel=ylabel,
+    )
+
+
+# ---------------------------------------------------------------------------
+# make_panel — build a sub-chart panel beneath the main candle chart
+# ---------------------------------------------------------------------------
+
+def make_panel(
+    data: pd.Series | pd.DataFrame | list | np.ndarray,
+    *,
+    ylabel: str = "Value",
+    height_ratio: float = 0.20,
+    color: str = "#1f77b4",
+    panel_type: str = "line",
+    width: float = 1.5,
+    linestyle: str = "-",
+    alpha: float = 1.0,
+    addplot: list[dict[str, Any]] | dict[str, Any] | None = None,
+) -> SubPanel:
+    """Build a :class:`SubPanel` for display below the main candlestick chart.
+
+    Sub-panels share the same zoomed and panned X axis as the main chart
+    but have their own independent Y axis and Y range.
+
+    Parameters
+    ----------
+    data : array-like
+        1-D y-values of the same length as the OHLCV DataFrame passed to
+        ``plot()``.
+    ylabel : str
+        Panel title shown in the top-left corner and in the master legend.
+    height_ratio : float
+        Fraction of total widget height given to this panel (default 0.20).
+    color : str
+        Line or bar colour.
+    panel_type : str
+        ``'line'`` for a continuous line, ``'histogram'`` for bars anchored
+        at zero (useful for RSI, momentum, volume-like indicators).
+    width : float
+        Line / outline width in pixels.
+    linestyle : str
+        ``'-'``, ``'--'``, ``'-.'``, or ``':'`` (line panels only).
+    alpha : float
+        Opacity 0–1.
+    addplot : dict or list[dict] or None
+        Optional overlay(s) drawn on this panel (e.g. a horizontal RSI
+        threshold line).  Build them with :func:`make_addplot`.
+
+    Returns
+    -------
+    SubPanel
+        Pass this to ``wickly.plot(panels=[panel])`` or
+        ``widget.add_panel(panel)``.
+
+    Examples
+    --------
+    >>> rsi = compute_rsi(df["Close"], period=14)
+    >>> panel = wickly.make_panel(rsi, ylabel="RSI", color="#ff9800",
+    ...                           panel_type="line", height_ratio=0.20)
+    >>> wickly.plot(df, type="candle", volume=True, panels=[panel])
+    """
+    values = _normalise_1d(data)
+
+    addplots_list: list[dict[str, Any]] = []
+    if addplot is not None:
+        if isinstance(addplot, dict):
+            addplots_list = [addplot]
+        else:
+            addplots_list = list(addplot)
+
+    valid_types = ("line", "histogram")
+    if panel_type not in valid_types:
+        raise ValueError(
+            f"panel_type must be one of {valid_types}, got '{panel_type}'"
+        )
+
+    return SubPanel(
+        data=values,
+        ylabel=ylabel,
+        height_ratio=height_ratio,
+        color=color,
+        panel_type=panel_type,
+        width=width,
+        linestyle=linestyle,
+        alpha=alpha,
+        addplots=addplots_list,
     )
