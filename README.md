@@ -2,6 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests](https://github.com/ShreyanshDarshan/wickly/actions/workflows/tests.yml/badge.svg)](https://github.com/ShreyanshDarshan/wickly/actions/workflows/tests.yml)
+[![Documentation](https://readthedocs.org/projects/wickly/badge/?version=latest)](https://wickly.readthedocs.io/)
+
 
 **Interactive candlestick chart plotting with PyQt6** — drop-in replacement for `mplfinance` with rich interactivity.
 
