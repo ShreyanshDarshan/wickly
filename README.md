@@ -63,81 +63,9 @@ df = pd.read_csv("your_data.csv", index_col=0, parse_dates=True)
 wickly.plot(df, type='candle', volume=True, mav=(10, 20), style='yahoo', title='My Chart')
 ```
 
-## API Reference
+## Documentation
 
-### `wickly.plot(data, **kwargs)`
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `data` | DataFrame | *required* | OHLCV DataFrame with DatetimeIndex |
-| `type` | str | `'ohlc'` | `'candle'`, `'ohlc'`, `'line'`, `'hollow'` |
-| `style` | str or dict | `'default'` | Style name or dict of color settings |
-| `volume` | bool | `False` | Show volume subplot |
-| `mav` | int or tuple | `None` | Moving average period(s) |
-| `title` | str | `None` | Chart title |
-| `ylabel` | str | `'Price'` | Y-axis label |
-| `figsize` | tuple | `(960, 600)` | Widget size in pixels `(width, height)` |
-| `returnfig` | bool | `False` | Return `(widget, axes_dict)` instead of showing |
-| `savefig` | str | `None` | Save chart to file path |
-| `addplot` | dict/list | `None` | Additional plots (see `make_addplot`) |
-| `columns` | tuple | `("Open","High","Low","Close","Volume")` | Column name mapping |
-| `block` | bool | `True` | Block until window is closed |
-
-### `wickly.live_plot(data, **kwargs)`
-
-Opens a non-blocking chart designed for animated / live updates. Accepts
-the same keyword arguments as `plot()` (except `returnfig` and `block`,
-which are forced to `True` / `False`). Returns `(widget, axes_dict)`.
-
-Use the returned widget to push new data:
-
-| Method | Description |
-|--------|-------------|
-| `widget.append_data(dates, opens, highs, lows, closes, volumes)` | Append one or more bars. Auto-scrolls to the right edge. |
-| `widget.update_last(close=..., high=..., low=..., open_=..., volume=...)` | Update the most recent bar in-place (live tick). |
-
-```python
-widget, axes = wickly.live_plot(df, type='candle', volume=True)
-# Append a new bar
-widget.append_data(new_dates, opens, highs, lows, closes, volumes)
-# Update the current candle with a live tick
-widget.update_last(close=latest_price)
-```
-
-### `wickly.make_addplot(data, **kwargs)`
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `data` | Series/list | *required* | Data to overlay (or list of `(start, values)` tuples for `type='segments'`) |
-| `type` | str | `'line'` | `'line'`, `'scatter'`, or `'segments'` |
-| `color` | str | `None` | Line / marker color |
-| `width` | float | `1.5` | Line width |
-| `scatter` | bool | `False` | *Deprecated* — use `type='scatter'` |
-| `marker` | str | `'o'` | Scatter marker character |
-| `markersize` | float | `50` | Scatter marker size |
-| `ylabel` | str | `None` | Legend label — if set, the overlay appears in the chart legend |
-
-### `wickly.make_segments(segments, **kwargs)`
-
-Convenience wrapper for `make_addplot(type='segments')` — builds an addplot dict
-for multiple independent, possibly overlapping, line segments.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `segments` | list | *required* | List of `(start_index, y_values)` tuples |
-| `color` | str | `None` | Line color |
-| `width` | float | `1.5` | Line width |
-| `alpha` | float | `1.0` | Opacity |
-| `linestyle` | str | `'-'` | `'-'`, `'--'`, `'-.'`, `':'` |
-| `ylabel` | str | `None` | Legend label |
-
-### `wickly.make_style(**kwargs)`
-
-Create a custom style dict with keys: `up_color`, `down_color`, `volume_up`, `volume_down`, `bg_color`, `grid_color`, `edge_up`, `edge_down`, `wick_up`, `wick_down`.
-
-### `wickly.available_styles()`
-
-Returns a list of available built-in style names.
+Full API reference, quickstart guide, and examples are available at **[wickly.readthedocs.io](https://wickly.readthedocs.io/)**.
 
 ## Contributing
 
