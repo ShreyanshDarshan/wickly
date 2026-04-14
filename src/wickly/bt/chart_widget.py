@@ -1,0 +1,268 @@
+"""BacktestWidget — CandlestickWidget subclass for backtesting results."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from wickly._utils import check_and_prepare_data
+from wickly.addplot import SubPanel, make_addplot, make_segments, make_panel
+from wickly.chart_widget import CandlestickWidget
+from wickly.styles import _get_style
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _is_overlay(values: np.ndarray, closes: np.ndarray) -> bool:
+    """Heuristic: indicator is an overlay if most values are near Close.
+
+    Uses the same rule as backtesting.py — if >60 % of values are within
+    40 % of the close price, it is classified as an overlay.
+    """
+    n = min(len(values), len(closes))
+    values, closes = values[:n], closes[:n]
+    valid = ~(np.isnan(values) | np.isnan(closes))
+    if valid.sum() < 2:
+        return False
+    ratio = values[valid] / closes[valid]
+    return bool(((ratio > 0.6) & (ratio < 1.4)).mean() > 0.6)
+
+
+def _build_trade_segments(
+    trades: pd.DataFrame,
+    n: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return ``(winner_addplot, loser_addplot)`` segment dicts."""
+    if trades is None or trades.empty:
+        return None, None
+
+    win_segs: list[tuple[int, np.ndarray]] = []
+    loss_segs: list[tuple[int, np.ndarray]] = []
+
+    for _, t in trades.iterrows():
+        entry_bar = int(t["EntryBar"])
+        exit_bar = int(t["ExitBar"])
+        entry_price = float(t["EntryPrice"])
+        exit_price = float(t["ExitPrice"])
+        pnl = float(t["PnL"])
+
+        length = max(exit_bar - entry_bar + 1, 2)
+        values = np.linspace(entry_price, exit_price, length)
+        seg = (entry_bar, values)
+
+        if pnl >= 0:
+            win_segs.append(seg)
+        else:
+            loss_segs.append(seg)
+
+    win_ap = (
+        make_segments(win_segs, color="#26a69a", width=1.0,
+                      linestyle=":", ylabel="Winning trades")
+        if win_segs else None
+    )
+    loss_ap = (
+        make_segments(loss_segs, color="#ef5350", width=1.0,
+                      linestyle=":", ylabel="Losing trades")
+        if loss_segs else None
+    )
+    return win_ap, loss_ap
+
+
+def _build_pl_data(trades: pd.DataFrame, n: int) -> np.ndarray:
+    """Build a sparse P/L array with values only at trade-exit bars."""
+    pl = np.full(n, np.nan)
+    if trades is None or trades.empty:
+        return pl
+    for _, t in trades.iterrows():
+        exit_bar = int(t["ExitBar"])
+        if 0 <= exit_bar < n:
+            pl[exit_bar] = float(t["PnL"])
+    return pl
+
+
+# ---------------------------------------------------------------------------
+# Widget
+# ---------------------------------------------------------------------------
+
+class BacktestWidget(CandlestickWidget):
+    """Candlestick chart augmented with backtesting results.
+
+    This is a thin wrapper around :class:`~wickly.chart_widget.CandlestickWidget`
+    that converts equity curves, trades, and strategy indicators into the
+    regular addplot / sub-panel primitives the base widget already renders.
+
+    Parameters
+    ----------
+    parent : QWidget or None
+        Optional parent widget.
+    data : pd.DataFrame
+        OHLCV DataFrame (same format as ``wickly.plot``).
+    equity_curve : pd.DataFrame or None
+        DataFrame with at least an ``Equity`` column (and optionally
+        ``DrawdownPct``).  Typically ``stats['_equity_curve']``.
+    trades : pd.DataFrame or None
+        Trade log with ``EntryBar``, ``ExitBar``, ``EntryPrice``,
+        ``ExitPrice``, ``PnL`` columns.  Typically ``stats['_trades']``.
+    indicators : list of dict or None
+        Each dict has keys ``data`` (array), ``name`` (str), and optionally
+        ``overlay`` (bool), ``color`` (str), ``scatter`` (bool).
+    addplots : list of dict or None
+        User-supplied addplots to merge with auto-generated ones.
+    style : str or dict or None
+        Visual style.
+    plot_equity / plot_return / plot_drawdown / plot_volume / plot_trades / plot_pl : bool
+        Toggle individual chart panels.
+    smooth_equity : bool
+        Show equity changes only at trade-exit bars.
+    relative_equity : bool
+        Show equity as percentage return from the initial value.
+    show_legend : bool
+        Display the chart legend.
+    title : str or None
+        Window title.
+    """
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        data: pd.DataFrame,
+        equity_curve: pd.DataFrame | None = None,
+        trades: pd.DataFrame | None = None,
+        indicators: list[dict[str, Any]] | None = None,
+        addplots: list[dict[str, Any]] | None = None,
+        style: dict[str, Any] | str | None = None,
+        plot_equity: bool = True,
+        plot_return: bool = False,
+        plot_drawdown: bool = False,
+        plot_volume: bool = True,
+        plot_trades: bool = True,
+        plot_pl: bool = True,
+        smooth_equity: bool = False,
+        relative_equity: bool = True,
+        show_legend: bool = True,
+        title: str | None = None,
+    ):
+        resolved_style = _get_style(style)
+        opens, highs, lows, closes, volumes, dates = check_and_prepare_data(data)
+        n = len(closes)
+
+        # --- build addplots and panels from backtest data ---------------------
+        all_addplots: list[dict[str, Any]] = list(addplots) if addplots else []
+        panels: list[SubPanel] = []
+
+        # Trade entry→exit segments
+        if plot_trades and trades is not None and not trades.empty:
+            win_ap, loss_ap = _build_trade_segments(trades, n)
+            if win_ap:
+                all_addplots.append(win_ap)
+            if loss_ap:
+                all_addplots.append(loss_ap)
+
+        # Equity curve panel
+        if plot_equity and equity_curve is not None and "Equity" in equity_curve.columns:
+            eq = equity_curve["Equity"].values.astype(float).copy()
+            if smooth_equity:
+                mask = np.diff(eq, prepend=eq[0]) != 0
+                mask[0] = True
+                eq_smooth = np.full_like(eq, np.nan)
+                eq_smooth[mask] = eq[mask]
+                last = eq[0]
+                for i in range(len(eq_smooth)):
+                    if np.isnan(eq_smooth[i]):
+                        eq_smooth[i] = last
+                    else:
+                        last = eq_smooth[i]
+                eq = eq_smooth
+            if relative_equity:
+                initial = eq[0] if eq[0] != 0 else 1.0
+                eq = (eq / initial - 1) * 100
+                panels.append(make_panel(eq[:n], ylabel="Return [%]",
+                                         color="#2196f3", height_ratio=0.15))
+            else:
+                panels.append(make_panel(eq[:n], ylabel="Equity",
+                                         color="#2196f3", height_ratio=0.15))
+
+        # Return panel (independent of equity panel)
+        if plot_return and equity_curve is not None and "Equity" in equity_curve.columns:
+            eq_ret = equity_curve["Equity"].values.astype(float)
+            initial = eq_ret[0] if eq_ret[0] != 0 else 1.0
+            ret = (eq_ret / initial - 1) * 100
+            panels.append(make_panel(ret[:n], ylabel="Return [%]",
+                                     color="#ff9800", height_ratio=0.12))
+
+        # Drawdown panel
+        if (plot_drawdown and equity_curve is not None
+                and "DrawdownPct" in equity_curve.columns):
+            dd = equity_curve["DrawdownPct"].values.astype(float) * -100
+            panels.append(make_panel(dd[:n], ylabel="Drawdown [%]",
+                                     color="#e91e63", height_ratio=0.12))
+
+        # P/L histogram
+        if plot_pl and trades is not None and not trades.empty:
+            pl = _build_pl_data(trades, n)
+            panels.append(make_panel(pl, ylabel="P/L", color="#7e57c2",
+                                     panel_type="histogram", height_ratio=0.12))
+
+        # Strategy indicators
+        if indicators:
+            for ind in indicators:
+                ind_data = np.asarray(ind["data"], dtype=float)
+                ind_name = ind.get("name", "Indicator")
+                ind_color = ind.get("color", None)
+                ind_scatter = ind.get("scatter", False)
+                overlay = ind.get("overlay", None)
+
+                if overlay is None:
+                    overlay = _is_overlay(ind_data, closes)
+
+                if overlay:
+                    ap_type = "scatter" if ind_scatter else "line"
+                    all_addplots.append(make_addplot(
+                        ind_data[:n], type=ap_type, color=ind_color,
+                        ylabel=ind_name,
+                    ))
+                else:
+                    if ind_scatter:
+                        panel_ap = [make_addplot(
+                            ind_data[:n], type="scatter", color=ind_color,
+                            ylabel=ind_name,
+                        )]
+                        panels.append(make_panel(
+                            np.full(n, np.nan), ylabel=ind_name,
+                            color=ind_color or "#1f77b4", height_ratio=0.12,
+                            addplot=panel_ap,
+                        ))
+                    else:
+                        panels.append(make_panel(
+                            ind_data[:n], ylabel=ind_name,
+                            color=ind_color or "#1f77b4", height_ratio=0.12,
+                        ))
+
+        # --- initialise base widget -------------------------------------------
+        show_vol = plot_volume and volumes is not None
+
+        super().__init__(
+            parent,
+            dates=dates,
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            volumes=volumes,
+            chart_type="candle",
+            style=resolved_style,
+            show_volume=show_vol,
+            title=title,
+            addplots=all_addplots,
+            panels=panels if panels else None,
+        )
+
+        # Expose for programmatic access
+        self._equity_curve = equity_curve
+        self._trades = trades
+        self._indicators_data = indicators
