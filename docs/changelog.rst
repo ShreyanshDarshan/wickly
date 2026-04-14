@@ -7,10 +7,7 @@ v0.1.1 (2026-04-14)
 *Documentation & distribution release. No API changes.*
 
 - Docs now hosted on Read the Docs at https://wickly.readthedocs.io/
-- Added ``.readthedocs.yaml`` configuration for versioned documentation
 - Package now available on PyPI — ``pip install wickly``
-- Added GitHub Actions workflow for automated PyPI publishing (OIDC Trusted Publishing)
-- Added GitHub Actions workflow to run tests on Python 3.9–3.12
 
 v0.1.0 (2026-04-12)
 --------------------
