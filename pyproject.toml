@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wickly"
-version = "0.1.0"
+version = "0.1.1"
 description = "Interactive candlestick chart plotting with PyQt6 — mplfinance-compatible API"
 readme = "README.md"
 license = {text = "MIT"}
