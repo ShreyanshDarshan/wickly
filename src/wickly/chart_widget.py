@@ -71,6 +71,10 @@ class CandlestickWidget(QWidget):
     # Chart / volume height ratio
     VOLUME_RATIO = 0.20  # 20 % of usable height when volume is shown
 
+    # Level-of-detail budget: if the visible range exceeds this many bars
+    # the data is aggregated to a lower temporal resolution for rendering.
+    CANDLE_BUDGET = 500
+
     def __init__(
         self,
         parent: QWidget | None = None,
@@ -642,6 +646,182 @@ class CandlestickWidget(QWidget):
         return max(1.0, spacing * 0.7)
 
     # ------------------------------------------------------------------
+    # Aggregation (level-of-detail)
+    # ------------------------------------------------------------------
+
+    def _compute_agg_factor(self) -> int:
+        """How many raw bars to merge into one display bar."""
+        count = self._view_end - self._view_start + 1
+        if count <= self.CANDLE_BUDGET:
+            return 1
+        return math.ceil(count / self.CANDLE_BUDGET)
+
+    @staticmethod
+    def _agg_1d(data: np.ndarray, factor: int, n: int,
+                method: str = "last") -> np.ndarray:
+        """Downsample a 1-D array by groups of *factor* elements."""
+        if len(data) < n:
+            tmp = np.full(n, np.nan)
+            tmp[: len(data)] = data
+            data = tmp
+        else:
+            data = data[:n]
+        n_agg = math.ceil(n / factor)
+        pad = n_agg * factor - n
+        if method == "sum":
+            arr = np.concatenate([np.where(np.isnan(data), 0.0, data),
+                                  np.zeros(pad)]) if pad else \
+                  np.where(np.isnan(data), 0.0, data)
+            return arr.reshape(n_agg, factor).sum(axis=1)
+        # "last" — take the value at the last raw bar of each group
+        ends = np.minimum(np.arange(n_agg) * factor + factor, n) - 1
+        return data[ends]
+
+    @staticmethod
+    def _agg_1d_scatter(data: np.ndarray, factor: int,
+                        n: int) -> np.ndarray:
+        """Downsample scatter: keep first non-NaN per group."""
+        if len(data) < n:
+            tmp = np.full(n, np.nan)
+            tmp[: len(data)] = data
+            data = tmp
+        else:
+            data = data[:n]
+        n_agg = math.ceil(n / factor)
+        result = np.full(n_agg, np.nan)
+        starts = np.arange(n_agg) * factor
+        ends = np.minimum(starts + factor, n)
+        for i in range(n_agg):
+            chunk = data[starts[i] : ends[i]]
+            mask = ~np.isnan(chunk)
+            if mask.any():
+                result[i] = chunk[mask][0]
+        return result
+
+    def _enter_aggregated_mode(self, factor: int) -> dict[str, Any]:
+        """Replace internal arrays with aggregated versions for painting."""
+        n = self._n
+        n_agg = math.ceil(n / factor)
+        pad = n_agg * factor - n
+
+        saved: dict[str, Any] = {
+            "opens": self._opens, "highs": self._highs,
+            "lows": self._lows, "closes": self._closes,
+            "volumes": self._volumes, "dates": self._dates,
+            "n": n, "view_start": self._view_start,
+            "view_end": self._view_end, "pan_offset": self._pan_offset,
+            "mav_data": self._mav_data,
+            "addplots": self._addplots,
+            "sub_panels": self._sub_panels,
+        }
+
+        starts = np.arange(n_agg) * factor
+        ends = np.minimum(starts + factor, n)
+
+        # ---- OHLCV ------------------------------------------------------------
+        self._opens = saved["opens"][starts]
+        self._closes = saved["closes"][ends - 1]
+
+        if pad:
+            h = np.concatenate([saved["highs"], np.full(pad, -np.inf)])
+            lo = np.concatenate([saved["lows"], np.full(pad, np.inf)])
+        else:
+            h, lo = saved["highs"].copy(), saved["lows"].copy()
+        self._highs = h.reshape(n_agg, factor).max(axis=1)
+        self._lows = lo.reshape(n_agg, factor).min(axis=1)
+
+        if saved["volumes"] is not None:
+            v = np.concatenate([saved["volumes"], np.zeros(pad)]) if pad else saved["volumes"]
+            self._volumes = v.reshape(n_agg, factor).sum(axis=1)
+
+        if saved["dates"] is not None:
+            self._dates = saved["dates"][starts]
+
+        # ---- view state -------------------------------------------------------
+        self._n = n_agg
+        self._view_start = saved["view_start"] // factor
+        self._view_end = min(saved["view_end"] // factor, n_agg - 1)
+        self._pan_offset = saved["pan_offset"] / factor
+
+        # ---- MAVs -------------------------------------------------------------
+        self._mav_data = [
+            self._agg_1d(ma, factor, n) for ma in saved["mav_data"]
+        ]
+
+        # ---- addplots ---------------------------------------------------------
+        agg_addplots: list[dict[str, Any]] = []
+        for ap in saved["addplots"]:
+            agg = dict(ap)
+            if ap["type"] == "segments":
+                agg_segs: list[tuple[int, np.ndarray]] = []
+                for seg_start, seg_vals in ap["data"]:
+                    a_s = seg_start // factor
+                    seg_end_raw = seg_start + len(seg_vals) - 1
+                    a_e = seg_end_raw // factor
+                    a_len = a_e - a_s + 1
+                    if a_len < 1:
+                        continue
+                    a_vals = np.empty(a_len)
+                    for j in range(a_len):
+                        raw_hi = min((a_s + j + 1) * factor - 1,
+                                     seg_end_raw) - seg_start
+                        a_vals[j] = seg_vals[raw_hi]
+                    agg_segs.append((a_s, a_vals))
+                agg["data"] = agg_segs
+            elif ap["type"] == "scatter":
+                agg["data"] = self._agg_1d_scatter(ap["data"], factor, n)
+            else:
+                agg["data"] = self._agg_1d(ap["data"], factor, n)
+            agg_addplots.append(agg)
+        self._addplots = agg_addplots
+
+        # ---- sub-panels -------------------------------------------------------
+        agg_panels: list[SubPanel] = []
+        for panel in saved["sub_panels"]:
+            method = "sum" if panel.panel_type == "histogram" else "last"
+            agg_data = self._agg_1d(panel.data, factor, n, method)
+            agg_paps: list[dict[str, Any]] = []
+            for pap in panel.addplots:
+                agg_pap = dict(pap)
+                if pap["type"] == "scatter":
+                    agg_pap["data"] = self._agg_1d_scatter(
+                        pap["data"], factor, n)
+                elif pap["type"] != "segments":
+                    agg_pap["data"] = self._agg_1d(pap["data"], factor, n)
+                agg_paps.append(agg_pap)
+            agg_panels.append(SubPanel(
+                data=agg_data,
+                ylabel=panel.ylabel,
+                height_ratio=panel.height_ratio,
+                color=panel.color,
+                panel_type=panel.panel_type,
+                width=panel.width,
+                linestyle=panel.linestyle,
+                alpha=panel.alpha,
+                visible=panel.visible,
+                addplots=agg_paps,
+            ))
+        self._sub_panels = agg_panels
+
+        return saved
+
+    def _exit_aggregated_mode(self, saved: dict[str, Any]) -> None:
+        """Restore original data after aggregated painting."""
+        self._opens = saved["opens"]
+        self._highs = saved["highs"]
+        self._lows = saved["lows"]
+        self._closes = saved["closes"]
+        self._volumes = saved["volumes"]
+        self._dates = saved["dates"]
+        self._n = saved["n"]
+        self._view_start = saved["view_start"]
+        self._view_end = saved["view_end"]
+        self._pan_offset = saved["pan_offset"]
+        self._mav_data = saved["mav_data"]
+        self._addplots = saved["addplots"]
+        self._sub_panels = saved["sub_panels"]
+
+    # ------------------------------------------------------------------
     # Painting
     # ------------------------------------------------------------------
 
@@ -658,6 +838,15 @@ class CandlestickWidget(QWidget):
         if self._n == 0:
             return
 
+        factor = self._compute_agg_factor()
+        saved = self._enter_aggregated_mode(factor) if factor > 1 else None
+        try:
+            self._paint_impl(painter)
+        finally:
+            if saved is not None:
+                self._exit_aggregated_mode(saved)
+
+    def _paint_impl(self, painter: QPainter) -> None:
         s, e = self._visible_range()
         if s > e:
             return
