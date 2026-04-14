@@ -107,6 +107,91 @@ def _build_pl_data(trades: pd.DataFrame, n: int) -> np.ndarray:
     return pl
 
 
+def _build_pl_panel(trades: pd.DataFrame, n: int) -> SubPanel:
+    """Build a P/L panel with sloped trade segments and directional markers.
+
+    Each trade is a sloped line from ``(entry_bar, 0)`` to
+    ``(exit_bar, PnL)``.  The exit endpoint has a triangle marker:
+    up (``^``) for long trades, down (``v``) for short trades,
+    coloured green for profitable and red for losing trades.
+    """
+    win_segs: list[tuple[int, np.ndarray]] = []
+    loss_segs: list[tuple[int, np.ndarray]] = []
+    # Scatter arrays for exit markers (4 groups)
+    win_long = np.full(n, np.nan)
+    win_short = np.full(n, np.nan)
+    loss_long = np.full(n, np.nan)
+    loss_short = np.full(n, np.nan)
+
+    if trades is not None and not trades.empty:
+        for _, t in trades.iterrows():
+            entry_bar = int(t["EntryBar"])
+            exit_bar = int(t["ExitBar"])
+            pnl = float(t["PnL"])
+            size = float(t.get("Size", 1))
+            is_long = size > 0
+
+            length = max(exit_bar - entry_bar + 1, 2)
+            values = np.linspace(0.0, pnl, length)
+            seg = (entry_bar, values)
+
+            if pnl >= 0:
+                win_segs.append(seg)
+                if is_long:
+                    if 0 <= exit_bar < n:
+                        win_long[exit_bar] = pnl
+                else:
+                    if 0 <= exit_bar < n:
+                        win_short[exit_bar] = pnl
+            else:
+                loss_segs.append(seg)
+                if is_long:
+                    if 0 <= exit_bar < n:
+                        loss_long[exit_bar] = pnl
+                else:
+                    if 0 <= exit_bar < n:
+                        loss_short[exit_bar] = pnl
+
+    panel_addplots: list[dict] = []
+    if win_segs:
+        panel_addplots.append(make_segments(
+            win_segs, color="#26a69a", width=1.0, linestyle="-",
+        ))
+    if loss_segs:
+        panel_addplots.append(make_segments(
+            loss_segs, color="#ef5350", width=1.0, linestyle="-",
+        ))
+    # Markers at exit: green triangle-up (long win), green triangle-down (short win),
+    # red triangle-up (long loss), red triangle-down (short loss)
+    if not np.all(np.isnan(win_long)):
+        panel_addplots.append(make_addplot(
+            win_long, type="scatter", color="#26a69a", marker="^", markersize=60,
+        ))
+    if not np.all(np.isnan(win_short)):
+        panel_addplots.append(make_addplot(
+            win_short, type="scatter", color="#26a69a", marker="v", markersize=60,
+        ))
+    if not np.all(np.isnan(loss_long)):
+        panel_addplots.append(make_addplot(
+            loss_long, type="scatter", color="#ef5350", marker="^", markersize=60,
+        ))
+    if not np.all(np.isnan(loss_short)):
+        panel_addplots.append(make_addplot(
+            loss_short, type="scatter", color="#ef5350", marker="v", markersize=60,
+        ))
+
+    return SubPanel(
+        data=np.full(n, np.nan),
+        ylabel="P/L",
+        height_ratio=0.12,
+        color="#7e57c2",
+        panel_type="line",
+        addplots=panel_addplots,
+        skip_aggregation=True,
+        zero_centered=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Widget
 # ---------------------------------------------------------------------------
@@ -201,14 +286,65 @@ class BacktestWidget(CandlestickWidget):
                     else:
                         last = eq_smooth[i]
                 eq = eq_smooth
+            # Build drawdown overlay if available
+            eq_addplots: list[dict[str, Any]] = []
             if relative_equity:
                 initial = eq[0] if eq[0] != 0 else 1.0
-                eq = (eq / initial - 1) * 100
-                panels.append(make_panel(eq[:n], ylabel="Return [%]",
-                                         color="#2196f3", height_ratio=0.15))
+                eq = (eq / initial - 1) * 100 + 100
+
+                if plot_drawdown:
+                    # Running peak of eq; draw horizontal segments where
+                    # the peak sits above the current equity curve.
+                    peak = np.maximum.accumulate(eq[:n])
+                    underwater = peak > eq[:n]
+                    dd_segs: list[tuple[int, np.ndarray]] = []
+                    i = 0
+                    while i < n:
+                        if underwater[i]:
+                            start = i
+                            level = peak[i]
+                            while i < n and underwater[i] and peak[i] == level:
+                                i += 1
+                            dd_segs.append((start, np.full(i - start, level)))
+                        else:
+                            i += 1
+                    if dd_segs:
+                        eq_addplots.append(make_segments(
+                            dd_segs, color="#e91e63", width=1.0,
+                            linestyle="-", ylabel="Max Drawdown",
+                        ))
+
+                panel = make_panel(eq[:n], ylabel="Equity [%]",
+                                   color="#2196f3", height_ratio=0.15,
+                                   addplot=eq_addplots or None)
+                panel.skip_aggregation = True
+                panels.append(panel)
             else:
-                panels.append(make_panel(eq[:n], ylabel="Equity",
-                                         color="#2196f3", height_ratio=0.15))
+                if plot_drawdown:
+                    peak = np.maximum.accumulate(eq[:n])
+                    underwater = peak > eq[:n]
+                    dd_segs_abs: list[tuple[int, np.ndarray]] = []
+                    i = 0
+                    while i < n:
+                        if underwater[i]:
+                            start = i
+                            level = peak[i]
+                            while i < n and underwater[i] and peak[i] == level:
+                                i += 1
+                            dd_segs_abs.append((start, np.full(i - start, level)))
+                        else:
+                            i += 1
+                    if dd_segs_abs:
+                        eq_addplots.append(make_segments(
+                            dd_segs_abs, color="#e91e63", width=1.0,
+                            linestyle="-", ylabel="Max Drawdown",
+                        ))
+
+                panel = make_panel(eq[:n], ylabel="Equity",
+                                   color="#2196f3", height_ratio=0.15,
+                                   addplot=eq_addplots or None)
+                panel.skip_aggregation = True
+                panels.append(panel)
 
         # Return panel (independent of equity panel)
         if plot_return and equity_curve is not None and "Equity" in equity_curve.columns:
@@ -217,19 +353,11 @@ class BacktestWidget(CandlestickWidget):
             ret = (eq_ret / initial - 1) * 100
             panels.append(make_panel(ret[:n], ylabel="Return [%]",
                                      color="#ff9800", height_ratio=0.12))
+            panels[-1].skip_aggregation = True
 
-        # Drawdown panel
-        if (plot_drawdown and equity_curve is not None
-                and "DrawdownPct" in equity_curve.columns):
-            dd = equity_curve["DrawdownPct"].values.astype(float) * -100
-            panels.append(make_panel(dd[:n], ylabel="Drawdown [%]",
-                                     color="#e91e63", height_ratio=0.12))
-
-        # P/L histogram
+        # P/L panel with sloped trade segments
         if plot_pl and trades is not None and not trades.empty:
-            pl = _build_pl_data(trades, n)
-            panels.append(make_panel(pl, ylabel="P/L", color="#7e57c2",
-                                     panel_type="histogram", height_ratio=0.12))
+            panels.append(_build_pl_panel(trades, n))
 
         # Strategy indicators
         color_idx = 0

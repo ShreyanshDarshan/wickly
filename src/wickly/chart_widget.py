@@ -11,6 +11,7 @@ from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QPen, QColor, QBrush, QFont, QFontMetrics,
     QWheelEvent, QMouseEvent, QPaintEvent, QResizeEvent, QPixmap,
+    QPolygonF,
 )
 from PyQt6.QtWidgets import QWidget, QToolTip
 from PyQt6 import sip
@@ -133,6 +134,7 @@ class CandlestickWidget(QWidget):
         self._view_start = 0
         self._view_end   = max(n - 1, 0)
         self._pan_offset = 0.0   # fractional bar offset for smooth panning
+        self._agg_orig_view: tuple[int, int] | None = None
 
         # interaction
         self._dragging     = False
@@ -673,6 +675,13 @@ class CandlestickWidget(QWidget):
                                   np.zeros(pad)]) if pad else \
                   np.where(np.isnan(data), 0.0, data)
             return arr.reshape(n_agg, factor).sum(axis=1)
+        if method == "mean":
+            padded = np.concatenate([data, np.full(pad, np.nan)]) if pad else data
+            reshaped = padded.reshape(n_agg, factor)
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.simplefilter("ignore", RuntimeWarning)
+                return np.nanmean(reshaped, axis=1)
         # "last" — take the value at the last raw bar of each group
         ends = np.minimum(np.arange(n_agg) * factor + factor, n) - 1
         return data[ends]
@@ -745,7 +754,7 @@ class CandlestickWidget(QWidget):
 
         # ---- MAVs -------------------------------------------------------------
         self._mav_data = [
-            self._agg_1d(ma, factor, n) for ma in saved["mav_data"]
+            self._agg_1d(ma, factor, n, "mean") for ma in saved["mav_data"]
         ]
 
         # ---- addplots ---------------------------------------------------------
@@ -771,14 +780,17 @@ class CandlestickWidget(QWidget):
             elif ap["type"] == "scatter":
                 agg["data"] = self._agg_1d_scatter(ap["data"], factor, n)
             else:
-                agg["data"] = self._agg_1d(ap["data"], factor, n)
+                agg["data"] = self._agg_1d(ap["data"], factor, n, "mean")
             agg_addplots.append(agg)
         self._addplots = agg_addplots
 
         # ---- sub-panels -------------------------------------------------------
         agg_panels: list[SubPanel] = []
         for panel in saved["sub_panels"]:
-            method = "sum" if panel.panel_type == "histogram" else "last"
+            if panel.skip_aggregation:
+                agg_panels.append(panel)
+                continue
+            method = "sum" if panel.panel_type == "histogram" else "mean"
             agg_data = self._agg_1d(panel.data, factor, n, method)
             agg_paps: list[dict[str, Any]] = []
             for pap in panel.addplots:
@@ -786,8 +798,24 @@ class CandlestickWidget(QWidget):
                 if pap["type"] == "scatter":
                     agg_pap["data"] = self._agg_1d_scatter(
                         pap["data"], factor, n)
-                elif pap["type"] != "segments":
-                    agg_pap["data"] = self._agg_1d(pap["data"], factor, n)
+                elif pap["type"] == "segments":
+                    agg_segs: list[tuple[int, np.ndarray]] = []
+                    for seg_start, seg_vals in pap["data"]:
+                        a_s = seg_start // factor
+                        seg_end_raw = seg_start + len(seg_vals) - 1
+                        a_e = seg_end_raw // factor
+                        a_len = a_e - a_s + 1
+                        if a_len < 1:
+                            continue
+                        a_vals = np.empty(a_len)
+                        for j in range(a_len):
+                            raw_hi = min((a_s + j + 1) * factor - 1,
+                                         seg_end_raw) - seg_start
+                            a_vals[j] = seg_vals[raw_hi]
+                        agg_segs.append((a_s, a_vals))
+                    agg_pap["data"] = agg_segs
+                else:
+                    agg_pap["data"] = self._agg_1d(pap["data"], factor, n, "mean")
                 agg_paps.append(agg_pap)
             agg_panels.append(SubPanel(
                 data=agg_data,
@@ -800,8 +828,13 @@ class CandlestickWidget(QWidget):
                 alpha=panel.alpha,
                 visible=panel.visible,
                 addplots=agg_paps,
+                zero_centered=panel.zero_centered,
             ))
         self._sub_panels = agg_panels
+
+        # store original view info for skip_aggregation panels
+        self._agg_orig_view = (saved["view_start"], saved["view_end"],
+                               saved["pan_offset"])
 
         return saved
 
@@ -820,6 +853,7 @@ class CandlestickWidget(QWidget):
         self._mav_data = saved["mav_data"]
         self._addplots = saved["addplots"]
         self._sub_panels = saved["sub_panels"]
+        self._agg_orig_view = None
 
     # ------------------------------------------------------------------
     # Painting
@@ -891,7 +925,21 @@ class CandlestickWidget(QWidget):
 
         # --- user sub-panels ----------------------------------------------------
         for panel, prect in zip(self._sub_panels, panel_rects):
-            self._draw_sub_panel(painter, panel, prect, s, e)
+            if panel.skip_aggregation and self._agg_orig_view is not None:
+                # Temporarily restore original view coords so _x_for_index
+                # maps segment indices correctly at full resolution.
+                orig_s, orig_e, orig_off = self._agg_orig_view
+                agg_s, agg_e, agg_off = (
+                    self._view_start, self._view_end, self._pan_offset)
+                self._view_start = orig_s
+                self._view_end = orig_e
+                self._pan_offset = orig_off
+                self._draw_sub_panel(painter, panel, prect, orig_s, orig_e)
+                self._view_start = agg_s
+                self._view_end = agg_e
+                self._pan_offset = agg_off
+            else:
+                self._draw_sub_panel(painter, panel, prect, s, e)
 
         # --- date axis ----------------------------------------------------------
         all_sub_rects = [
@@ -1207,18 +1255,7 @@ class CandlestickWidget(QWidget):
             if ap["type"] == "segments":
                 self._draw_segments(p, rect, s, e, lo, hi, ap, color)
             elif ap["type"] == "scatter":
-                data = ap["data"]
-                marker_size = ap.get("markersize", 50)
-                radius = math.sqrt(marker_size) / 2
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QBrush(color))
-                for i in range(s, e + 1):
-                    val = data[i] if i < len(data) else float("nan")
-                    if np.isnan(val):
-                        continue
-                    x = self._x_for_index(i, rect, s, e)
-                    y = self._y_for_price(val, rect, lo, hi)
-                    p.drawEllipse(QPointF(x, y), radius, radius)
+                self._draw_scatter(p, rect, s, e, lo, hi, ap, color)
             else:
                 # line
                 data = ap["data"]
@@ -1280,6 +1317,38 @@ class CandlestickWidget(QWidget):
                 if prev is not None:
                     p.drawLine(prev, pt)
                 prev = pt
+
+    def _draw_scatter(self, p: QPainter, rect: QRectF, s: int, e: int,
+                      lo: float, hi: float, ap: dict, color: QColor) -> None:
+        """Draw scatter markers with support for 'o', '^', and 'v' shapes."""
+        data = ap["data"]
+        marker_size = ap.get("markersize", 50)
+        radius = math.sqrt(marker_size) / 2
+        marker = ap.get("marker", "o")
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(color))
+        for i in range(s, e + 1):
+            val = data[i] if i < len(data) else float("nan")
+            if np.isnan(val):
+                continue
+            x = self._x_for_index(i, rect, s, e)
+            y = self._y_for_price(val, rect, lo, hi)
+            if marker == "^":
+                tri = QPolygonF([
+                    QPointF(x, y - radius),
+                    QPointF(x - radius, y + radius),
+                    QPointF(x + radius, y + radius),
+                ])
+                p.drawPolygon(tri)
+            elif marker == "v":
+                tri = QPolygonF([
+                    QPointF(x, y + radius),
+                    QPointF(x - radius, y - radius),
+                    QPointF(x + radius, y - radius),
+                ])
+                p.drawPolygon(tri)
+            else:
+                p.drawEllipse(QPointF(x, y), radius, radius)
 
     # ---- volume ----
     def _draw_volume(self, p: QPainter, rect: QRectF, s: int, e: int,
@@ -1366,21 +1435,39 @@ class CandlestickWidget(QWidget):
         """Compute the Y range for a sub-panel, or None if all data is NaN."""
         seg = panel.data[s : e + 1]
         valid = seg[~np.isnan(seg)]
-        if len(valid) == 0:
-            return None
-        lo = float(np.nanmin(valid))
-        hi = float(np.nanmax(valid))
+        has_data = len(valid) > 0
+        lo = float(np.nanmin(valid)) if has_data else float("inf")
+        hi = float(np.nanmax(valid)) if has_data else float("-inf")
         if panel.panel_type == "histogram":
             lo = min(lo, 0.0)
         # also include any addplot data on this panel
         for ap in panel.addplots:
-            if ap["type"] != "segments":
+            if ap["type"] == "segments":
+                for seg_start, seg_data in ap["data"]:
+                    seg_end = seg_start + len(seg_data)
+                    lo_idx = max(s, seg_start)
+                    hi_idx = min(e, seg_end - 1)
+                    if lo_idx > hi_idx:
+                        continue
+                    chunk = seg_data[lo_idx - seg_start : hi_idx - seg_start + 1]
+                    seg_valid = chunk[~np.isnan(chunk)]
+                    if len(seg_valid):
+                        lo = min(lo, float(np.nanmin(seg_valid)))
+                        hi = max(hi, float(np.nanmax(seg_valid)))
+                        has_data = True
+            else:
                 ap_seg = ap["data"][s : e + 1]
                 ap_valid = ap_seg[~np.isnan(ap_seg)]
                 if len(ap_valid):
                     lo = min(lo, float(np.nanmin(ap_valid)))
                     hi = max(hi, float(np.nanmax(ap_valid)))
+                    has_data = True
+        if not has_data:
+            return None
         pad = (hi - lo) * 0.05 if hi != lo else 1.0
+        if panel.zero_centered:
+            extreme = max(abs(lo), abs(hi))
+            return -(extreme + pad), extreme + pad
         return lo - pad, hi + pad
 
     def _draw_sub_panel(self, p: QPainter, panel: SubPanel,
@@ -1405,6 +1492,14 @@ class CandlestickWidget(QWidget):
             self._draw_panel_histogram(p, panel, rect, s, e, lo, hi, color)
         else:
             self._draw_panel_line(p, panel, rect, s, e, lo, hi, color)
+
+        # horizontal zero line
+        if panel.zero_centered and lo < 0 < hi:
+            zero_y = self._y_for_price(0.0, rect, lo, hi)
+            p.setPen(QPen(_qcolor(style.get("grid_color", "#e0e0e0")), 1,
+                          Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(rect.x(), zero_y),
+                       QPointF(rect.x() + rect.width(), zero_y))
 
         # overlays on this panel
         self._draw_addplot_list(p, panel.addplots, rect, s, e, lo, hi)
@@ -1479,30 +1574,36 @@ class CandlestickWidget(QWidget):
             color_str = ap.get("color") or "#1f77b4"
             ap_alpha = ap.get("alpha", 1.0)
             color = _qcolor(color_str, ap_alpha)
-            lw = ap.get("width", 1.5)
-            pen = QPen(color, lw)
-            ls = ap.get("linestyle", "-")
-            if ls in ("--", "dashed"):
-                pen.setStyle(Qt.PenStyle.DashLine)
-            elif ls in ("-.", "dashdot"):
-                pen.setStyle(Qt.PenStyle.DashDotLine)
-            elif ls in (":", "dotted"):
-                pen.setStyle(Qt.PenStyle.DotLine)
-            p.setPen(pen)
-            prev: QPointF | None = None
-            data = ap["data"]
-            for i in range(s, e + 1):
-                val = data[i] if i < len(data) else float("nan")
-                if np.isnan(val):
-                    prev = None
-                    continue
-                pt = QPointF(
-                    self._x_for_index(i, rect, s, e),
-                    self._y_for_price(val, rect, lo, hi),
-                )
-                if prev is not None:
-                    p.drawLine(prev, pt)
-                prev = pt
+
+            if ap["type"] == "segments":
+                self._draw_segments(p, rect, s, e, lo, hi, ap, color)
+            elif ap["type"] == "scatter":
+                self._draw_scatter(p, rect, s, e, lo, hi, ap, color)
+            else:
+                lw = ap.get("width", 1.5)
+                pen = QPen(color, lw)
+                ls = ap.get("linestyle", "-")
+                if ls in ("--", "dashed"):
+                    pen.setStyle(Qt.PenStyle.DashLine)
+                elif ls in ("-.", "dashdot"):
+                    pen.setStyle(Qt.PenStyle.DashDotLine)
+                elif ls in (":", "dotted"):
+                    pen.setStyle(Qt.PenStyle.DotLine)
+                p.setPen(pen)
+                prev: QPointF | None = None
+                data = ap["data"]
+                for i in range(s, e + 1):
+                    val = data[i] if i < len(data) else float("nan")
+                    if np.isnan(val):
+                        prev = None
+                        continue
+                    pt = QPointF(
+                        self._x_for_index(i, rect, s, e),
+                        self._y_for_price(val, rect, lo, hi),
+                    )
+                    if prev is not None:
+                        p.drawLine(prev, pt)
+                    prev = pt
 
     # ---- crosshair ----
     def _draw_crosshair(

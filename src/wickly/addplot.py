@@ -56,6 +56,8 @@ class SubPanel:
     alpha: float = 1.0
     visible: bool = True
     addplots: list[dict[str, Any]] = field(default_factory=list)
+    skip_aggregation: bool = False
+    zero_centered: bool = False
 
 
 def _normalise_1d(data: pd.Series | pd.DataFrame | list | np.ndarray) -> np.ndarray:
