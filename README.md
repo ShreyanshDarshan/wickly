@@ -24,11 +24,25 @@
 
 ## Installation
 
+### Install from PyPI
+
+The recommended way to install wickly:
+
 ```bash
+pip install wickly
+```
+
+### Install from source
+
+Clone the repository and install with pip:
+
+```bash
+git clone https://github.com/ShreyanshDarshan/wickly.git
+cd wickly
 pip install .
 ```
 
-Or in editable/development mode:
+Or in editable/development mode (includes pytest and build):
 
 ```bash
 pip install -e ".[dev]"

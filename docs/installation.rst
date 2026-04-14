@@ -9,6 +9,15 @@ Requirements
 - pandas ≥ 1.5
 - numpy ≥ 1.23
 
+Install from PyPI
+-----------------
+
+The recommended way to install wickly:
+
+.. code-block:: bash
+
+   pip install wickly
+
 Install from source
 -------------------
 
