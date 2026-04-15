@@ -151,6 +151,12 @@ class CandlestickWidget(QWidget):
         self._legend_hit_areas:  list[tuple[QRectF, QRectF, str, int]] = []
         self._legend_rect:       QRectF | None = None
 
+        # panel resize drag state
+        self._resizing_sep: int | None = None  # index into _separator_kinds
+        self._resize_last_y: float = 0.0
+        self._separator_kinds: list[tuple[str, int]] = []
+        # Each entry: ("vol_top", -1), ("panel_top", panel_idx), etc.
+
         # appearance
         self.setMouseTracking(True)
         self.setMinimumSize(480, 320)
@@ -545,6 +551,23 @@ class CandlestickWidget(QWidget):
                 panel_rects.append(QRectF(x, y, pw, 0.0))
 
         return main_rect, vol_rect, panel_rects
+
+    _SEPARATOR_GRAB = 5  # pixels above/below a separator line that count as a grab
+
+    def _separator_y_positions(self) -> list[tuple[float, str, int]]:
+        """Return (y, kind, index) for each draggable panel separator.
+
+        kind is one of: 'vol' (top of volume), 'panel' (top of a sub-panel).
+        index is -1 for volume, or the sub-panel index.
+        """
+        main_rect, vol_rect, panel_rects = self._layout_panels()
+        seps: list[tuple[float, str, int]] = []
+        if vol_rect is not None and vol_rect.height() > 0:
+            seps.append((vol_rect.y(), "vol", -1))
+        for i, pr in enumerate(panel_rects):
+            if pr.height() > 0:
+                seps.append((pr.y(), "panel", i))
+        return seps
 
     def _chart_rect(self) -> QRectF:
         """Return the rectangle for the main (OHLC) chart area."""
@@ -1121,7 +1144,7 @@ class CandlestickWidget(QWidget):
     def _draw_grid(self, p: QPainter, rect: QRectF, lo: float, hi: float, style: dict) -> None:
         pen = QPen(_qcolor(style.get("grid_color", "#e0e0e0")), 1, Qt.PenStyle.DotLine)
         p.setPen(pen)
-        n_lines = 6
+        n_lines = max(1, min(6, int(rect.height() / 30)))
         for i in range(n_lines + 1):
             y = rect.y() + i * rect.height() / n_lines
             p.drawLine(QPointF(rect.x(), y), QPointF(rect.x() + rect.width(), y))
@@ -1380,7 +1403,8 @@ class CandlestickWidget(QWidget):
         font = QFont("Segoe UI", 8)
         p.setFont(font)
         fm = QFontMetrics(font)
-        n_ticks = 6
+        label_h = fm.height()
+        n_ticks = max(1, min(6, int(rect.height() / max(label_h * 1.8, 1))))
         x_label = rect.x() + rect.width() + 6
         for i in range(n_ticks + 1):
             frac = i / n_ticks
@@ -1715,6 +1739,13 @@ class CandlestickWidget(QWidget):
                         self._sub_panels[kind_idx].visible = not self._sub_panels[kind_idx].visible
                     self.update()
                     return
+            # --- separator resize start ---
+            grab = self._SEPARATOR_GRAB
+            for sep_idx, (sy, skind, sidx) in enumerate(self._separator_y_positions()):
+                if abs(pos.y() - sy) <= grab:
+                    self._resizing_sep = sep_idx
+                    self._resize_last_y = pos.y()
+                    return
             # --- normal drag start ---
             self._dragging = True
             self._drag_last_x = pos.x()
@@ -1722,10 +1753,99 @@ class CandlestickWidget(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
+            self._resizing_sep = None
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         pos = event.position()
         self._mouse_pos = pos
+
+        # --- separator resize drag ---
+        if self._resizing_sep is not None:
+            dy = pos.y() - self._resize_last_y
+            if dy == 0:
+                self.update()
+                return
+            self._resize_last_y = pos.y()
+            usable_h = self.height() - self.MARGIN_TOP - self.MARGIN_BOTTOM
+            if usable_h <= 0:
+                self.update()
+                return
+            ratio_delta = dy / usable_h
+            seps = self._separator_y_positions()
+            if self._resizing_sep >= len(seps):
+                self._resizing_sep = None
+                self.update()
+                return
+            _, skind, sidx = seps[self._resizing_sep]
+            min_ratio = 0.03
+
+            # Determine above/below regions and transfer height between them.
+            # "below" is the panel whose top edge we're dragging.
+            # "above" is the region immediately above that separator.
+            def _get_ratio_below() -> float:
+                if skind == "vol":
+                    return self.VOLUME_RATIO
+                return self._sub_panels[sidx].height_ratio
+
+            def _set_ratio_below(v: float) -> None:
+                if skind == "vol":
+                    self.VOLUME_RATIO = v
+                else:
+                    self._sub_panels[sidx].height_ratio = v
+
+            # Find what's above this separator
+            sep_order: list[tuple[str, int]] = []
+            if self._show_volume and self._volume_visible:
+                sep_order.append(("vol", -1))
+            for pi, pp in enumerate(self._sub_panels):
+                if pp.visible:
+                    sep_order.append(("panel", pi))
+            # Find our position in the ordered list
+            cur_pos = -1
+            for ci, (ck, ci_idx) in enumerate(sep_order):
+                if ck == skind and ci_idx == sidx:
+                    cur_pos = ci
+                    break
+            if cur_pos <= 0:
+                # Top-most sub-region: above is main chart (implicit).
+                # Use effective (post-clamp) pixel sizes to compute the
+                # resize and write back normalised ratios.  This avoids the
+                # proportional-clamping artefact that otherwise prevents the
+                # boundary from moving when total_sub > max_sub.
+                main_now, vol_now, prects_now = self._layout_panels()
+                eff_vol = (vol_now.height() / usable_h) if vol_now is not None else 0.0
+                eff_panels = [pr.height() / usable_h for pr in prects_now]
+                sub_total = eff_vol + sum(eff_panels)
+                if sub_total <= 0:
+                    self.update()
+                    return
+                new_sub_total = max(0.10, min(0.90, sub_total - ratio_delta))
+                factor = new_sub_total / sub_total
+                if self._show_volume and self._volume_visible:
+                    self.VOLUME_RATIO = max(min_ratio, eff_vol * factor)
+                for pi2, pp2 in enumerate(self._sub_panels):
+                    if pp2.visible and pi2 < len(eff_panels):
+                        pp2.height_ratio = max(min_ratio, eff_panels[pi2] * factor)
+            else:
+                # Transfer between adjacent panels.
+                above_kind, above_idx = sep_order[cur_pos - 1]
+                old_below = _get_ratio_below()
+                if above_kind == "vol":
+                    old_above = self.VOLUME_RATIO
+                else:
+                    old_above = self._sub_panels[above_idx].height_ratio
+                new_below = max(min_ratio, old_below - ratio_delta)
+                actual_delta = old_below - new_below
+                new_above = max(min_ratio, old_above + actual_delta)
+                actual_delta = new_above - old_above
+                new_below = max(min_ratio, old_below - actual_delta)
+                _set_ratio_below(new_below)
+                if above_kind == "vol":
+                    self.VOLUME_RATIO = new_above
+                else:
+                    self._sub_panels[above_idx].height_ratio = new_above
+            self.update()
+            return
 
         # --- legend hover ---
         if self._legend_rect is not None and self._legend_rect.contains(pos):
@@ -1736,8 +1856,18 @@ class CandlestickWidget(QWidget):
                     break
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
+            # Check if hovering near a separator
+            grab = self._SEPARATOR_GRAB
+            near_sep = False
+            for sy, _, _ in self._separator_y_positions():
+                if abs(pos.y() - sy) <= grab:
+                    near_sep = True
+                    break
+            if near_sep:
+                self.setCursor(Qt.CursorShape.SplitVCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
             self._legend_hover_idx = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
 
         if self._dragging:
             dx = pos.x() - self._drag_last_x
@@ -1769,6 +1899,7 @@ class CandlestickWidget(QWidget):
     def leaveEvent(self, event: Any) -> None:  # noqa: N802
         self._mouse_pos = None
         self._legend_hover_idx = None
+        self._resizing_sep = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
 
