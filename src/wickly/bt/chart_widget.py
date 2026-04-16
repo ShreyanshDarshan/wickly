@@ -83,12 +83,12 @@ def _build_trade_segments(
             loss_segs.append(seg)
 
     win_ap = (
-        make_segments(win_segs, color="#26a69a", width=1.0,
+        make_segments(win_segs, color="#26a69a", width=8.0, alpha=0.3,
                       linestyle=":", ylabel="Winning trades")
         if win_segs else None
     )
     loss_ap = (
-        make_segments(loss_segs, color="#ef5350", width=1.0,
+        make_segments(loss_segs, color="#ef5350", width=8.0, alpha=0.3,
                       linestyle=":", ylabel="Losing trades")
         if loss_segs else None
     )
@@ -256,6 +256,7 @@ class BacktestWidget(CandlestickWidget):
         title: str | None = None,
     ):
         resolved_style = _get_style(style)
+        resolved_style["alpha"] = resolved_style.get("alpha", 1.0)
         opens, highs, lows, closes, volumes, dates = check_and_prepare_data(data)
         n = len(closes)
 
@@ -362,14 +363,16 @@ class BacktestWidget(CandlestickWidget):
         # Strategy indicators
         color_idx = 0
         if indicators:
+            # Pre-process: resolve colours and overlay flags
+            resolved_indicators: list[dict[str, Any]] = []
             for ind in indicators:
                 ind_data = np.asarray(ind["data"], dtype=float)
                 ind_name = ind.get("name", "Indicator")
                 ind_color = ind.get("color", None)
                 ind_scatter = ind.get("scatter", False)
                 overlay = ind.get("overlay", None)
+                group = ind.get("group", None)
 
-                # Auto-assign a distinct colour when none was specified
                 if ind_color is None:
                     ind_color = _INDICATOR_COLORS[
                         color_idx % len(_INDICATOR_COLORS)
@@ -379,27 +382,81 @@ class BacktestWidget(CandlestickWidget):
                 if overlay is None:
                     overlay = _is_overlay(ind_data, closes)
 
-                if overlay:
-                    ap_type = "scatter" if ind_scatter else "line"
+                resolved_indicators.append({
+                    "data": ind_data,
+                    "name": ind_name,
+                    "color": ind_color,
+                    "scatter": ind_scatter,
+                    "overlay": overlay,
+                    "group": group,
+                })
+
+            # Group non-overlay indicators by their group key
+            panel_groups: dict[str, list[dict[str, Any]]] = {}
+            panel_group_order: list[str] = []
+            for ri in resolved_indicators:
+                if ri["overlay"]:
+                    ap_type = "scatter" if ri["scatter"] else "line"
                     all_addplots.append(make_addplot(
-                        ind_data[:n], type=ap_type, color=ind_color,
-                        ylabel=ind_name,
+                        ri["data"][:n], type=ap_type, color=ri["color"],
+                        ylabel=ri["name"],
                     ))
                 else:
-                    if ind_scatter:
+                    key = ri["group"] or ri["name"]
+                    if key not in panel_groups:
+                        panel_groups[key] = []
+                        panel_group_order.append(key)
+                    panel_groups[key].append(ri)
+
+            # Create one subpanel per group
+            for key in panel_group_order:
+                group_inds = panel_groups[key]
+                if len(group_inds) == 1:
+                    ri = group_inds[0]
+                    if ri["scatter"]:
                         panel_ap = [make_addplot(
-                            ind_data[:n], type="scatter", color=ind_color,
-                            ylabel=ind_name,
+                            ri["data"][:n], type="scatter", color=ri["color"],
+                            ylabel=ri["name"],
                         )]
                         panels.append(make_panel(
-                            np.full(n, np.nan), ylabel=ind_name,
-                            color=ind_color, height_ratio=0.12,
+                            np.full(n, np.nan), ylabel=ri["name"],
+                            color=ri["color"], height_ratio=0.12,
                             addplot=panel_ap,
                         ))
                     else:
                         panels.append(make_panel(
-                            ind_data[:n], ylabel=ind_name,
-                            color=ind_color or "#1f77b4", height_ratio=0.12,
+                            ri["data"][:n], ylabel=ri["name"],
+                            color=ri["color"] or "#1f77b4",
+                            height_ratio=0.12,
+                        ))
+                else:
+                    # Multiple outputs → single panel with first as
+                    # the primary line and the rest as addplots.
+                    first = group_inds[0]
+                    extra_ap: list[dict[str, Any]] = []
+                    for ri in group_inds[1:]:
+                        ap_type = "scatter" if ri["scatter"] else "line"
+                        extra_ap.append(make_addplot(
+                            ri["data"][:n], type=ap_type,
+                            color=ri["color"], ylabel=ri["name"],
+                        ))
+                    first_type = "scatter" if first["scatter"] else "line"
+                    if first["scatter"]:
+                        extra_ap.insert(0, make_addplot(
+                            first["data"][:n], type="scatter",
+                            color=first["color"], ylabel=first["name"],
+                        ))
+                        panels.append(make_panel(
+                            np.full(n, np.nan), ylabel=key,
+                            color=first["color"], height_ratio=0.12,
+                            addplot=extra_ap,
+                        ))
+                    else:
+                        panels.append(make_panel(
+                            first["data"][:n], ylabel=key,
+                            color=first["color"] or "#1f77b4",
+                            height_ratio=0.12,
+                            addplot=extra_ap or None,
                         ))
 
         # --- initialise base widget -------------------------------------------

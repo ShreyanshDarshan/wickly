@@ -130,6 +130,7 @@ def plot(
                             "overlay": ind_overlay,
                             "color": ind_color,
                             "scatter": ind_scatter,
+                            "group": ind_name,
                         })
                 else:
                     indicators.append({
