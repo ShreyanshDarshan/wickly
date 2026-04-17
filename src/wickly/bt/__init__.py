@@ -9,5 +9,18 @@ PyQt6 rendering:
 
 from wickly.bt.chart_widget import BacktestWidget
 from wickly.bt.plotting import plot
+from wickly.bt._indicator_registry import (
+    IndicatorSpec,
+    OutputSpec,
+    RefLine,
+    register_indicator,
+)
 
-__all__ = ["BacktestWidget", "plot"]
+__all__ = [
+    "BacktestWidget",
+    "plot",
+    "IndicatorSpec",
+    "OutputSpec",
+    "RefLine",
+    "register_indicator",
+]

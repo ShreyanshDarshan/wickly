@@ -9,6 +9,7 @@ import pandas as pd
 
 from wickly._utils import check_and_prepare_data
 from wickly.addplot import SubPanel, make_addplot, make_segments, make_panel
+from wickly.bt._indicator_registry import lookup as _lookup_indicator, OutputSpec
 from wickly.chart_widget import CandlestickWidget
 from wickly.styles import _get_style
 
@@ -187,7 +188,7 @@ def _build_pl_panel(trades: pd.DataFrame, n: int) -> SubPanel:
         color="#7e57c2",
         panel_type="line",
         addplots=panel_addplots,
-        skip_aggregation=True,
+        aggregation_method="none",
         zero_centered=True,
     )
 
@@ -318,7 +319,7 @@ class BacktestWidget(CandlestickWidget):
                 panel = make_panel(eq[:n], ylabel="Equity [%]",
                                    color="#2196f3", height_ratio=0.15,
                                    addplot=eq_addplots or None)
-                panel.skip_aggregation = True
+                panel.aggregation_method = "none"
                 panels.append(panel)
             else:
                 if plot_drawdown:
@@ -344,7 +345,7 @@ class BacktestWidget(CandlestickWidget):
                 panel = make_panel(eq[:n], ylabel="Equity",
                                    color="#2196f3", height_ratio=0.15,
                                    addplot=eq_addplots or None)
-                panel.skip_aggregation = True
+                panel.aggregation_method = "none"
                 panels.append(panel)
 
         # Return panel (independent of equity panel)
@@ -354,7 +355,7 @@ class BacktestWidget(CandlestickWidget):
             ret = (eq_ret / initial - 1) * 100
             panels.append(make_panel(ret[:n], ylabel="Return [%]",
                                      color="#ff9800", height_ratio=0.12))
-            panels[-1].skip_aggregation = True
+            panels[-1].aggregation_method = "none"
 
         # P/L panel with sloped trade segments
         if plot_pl and trades is not None and not trades.empty:
@@ -411,53 +412,165 @@ class BacktestWidget(CandlestickWidget):
             # Create one subpanel per group
             for key in panel_group_order:
                 group_inds = panel_groups[key]
-                if len(group_inds) == 1:
-                    ri = group_inds[0]
-                    if ri["scatter"]:
-                        panel_ap = [make_addplot(
-                            ri["data"][:n], type="scatter", color=ri["color"],
-                            ylabel=ri["name"],
-                        )]
-                        panels.append(make_panel(
-                            np.full(n, np.nan), ylabel=ri["name"],
-                            color=ri["color"], height_ratio=0.12,
-                            addplot=panel_ap,
-                        ))
-                    else:
-                        panels.append(make_panel(
-                            ri["data"][:n], ylabel=ri["name"],
-                            color=ri["color"] or "#1f77b4",
-                            height_ratio=0.12,
-                        ))
-                else:
-                    # Multiple outputs → single panel with first as
-                    # the primary line and the rest as addplots.
-                    first = group_inds[0]
-                    extra_ap: list[dict[str, Any]] = []
-                    for ri in group_inds[1:]:
-                        ap_type = "scatter" if ri["scatter"] else "line"
-                        extra_ap.append(make_addplot(
+                spec = _lookup_indicator(key)
+
+                if spec is not None and spec.outputs and len(spec.outputs) == len(group_inds):
+                    # ---- Registry: full role-based layout --------------------------------
+                    # Find which output is the panel primary (role 'primary' or 'histogram').
+                    primary_ri: dict[str, Any] | None = None
+                    primary_ospec: OutputSpec | None = None
+                    addplot_pairs: list[tuple[dict[str, Any], OutputSpec]] = []
+                    for ri, ospec in zip(group_inds, spec.outputs):
+                        if ospec.role in ("primary", "histogram") and primary_ri is None:
+                            primary_ri = ri
+                            primary_ospec = ospec
+                        else:
+                            addplot_pairs.append((ri, ospec))
+                    if primary_ri is None:
+                        # All outputs are addplot-type; promote first to primary
+                        primary_ri = group_inds[0]
+                        primary_ospec = spec.outputs[0]
+                        addplot_pairs = list(zip(group_inds[1:], spec.outputs[1:]))
+
+                    panel_ap: list[dict[str, Any]] = []
+                    for ri, ospec in addplot_pairs:
+                        ap_type = "scatter" if ospec.role == "scatter" else "line"
+                        panel_ap.append(make_addplot(
                             ri["data"][:n], type=ap_type,
-                            color=ri["color"], ylabel=ri["name"],
+                            color=ospec.color or ri["color"],
+                            ylabel=ospec.ylabel or ri["name"],
+                            width=ospec.width,
                         ))
-                    first_type = "scatter" if first["scatter"] else "line"
-                    if first["scatter"]:
-                        extra_ap.insert(0, make_addplot(
-                            first["data"][:n], type="scatter",
-                            color=first["color"], ylabel=first["name"],
+                    for rl in spec.ref_lines:
+                        panel_ap.append(make_addplot(
+                            np.full(n, rl.value), type="line",
+                            color=rl.color, linestyle=rl.linestyle, width=rl.width,
                         ))
-                        panels.append(make_panel(
-                            np.full(n, np.nan), ylabel=key,
-                            color=first["color"], height_ratio=0.12,
-                            addplot=extra_ap,
-                        ))
+
+                    ptype = "histogram" if (primary_ospec and primary_ospec.role == "histogram") else "line"
+                    pcol = (primary_ospec.color if primary_ospec else None) or primary_ri["color"]
+                    panel = make_panel(
+                        primary_ri["data"][:n],
+                        ylabel=primary_ospec.ylabel if primary_ospec else primary_ri["name"],
+                        color=pcol or "#1f77b4",
+                        height_ratio=spec.height_ratio,
+                        panel_type=ptype,
+                        addplot=panel_ap or None,
+                    )
+                    panel.zero_centered = spec.zero_centered
+                    if ptype == "histogram":
+                        panel.aggregation_method = "mean"
+                    if primary_ospec and primary_ospec.bar_color_mode:
+                        panel.bar_color_mode = primary_ospec.bar_color_mode
+                    panels.append(panel)
+
+                elif spec is not None:
+                    # ---- Registry: params-only (no output roles or count mismatch) ----
+                    ref_ap: list[dict[str, Any]] = [
+                        make_addplot(
+                            np.full(n, rl.value), type="line",
+                            color=rl.color, linestyle=rl.linestyle, width=rl.width,
+                        )
+                        for rl in spec.ref_lines
+                    ]
+                    if len(group_inds) == 1:
+                        ri = group_inds[0]
+                        if ri["scatter"]:
+                            scatter_ap = [make_addplot(
+                                ri["data"][:n], type="scatter",
+                                color=ri["color"], ylabel=ri["name"],
+                            )] + ref_ap
+                            panel = make_panel(
+                                np.full(n, np.nan), ylabel=ri["name"],
+                                color=ri["color"], height_ratio=spec.height_ratio,
+                                panel_type=spec.panel_type, addplot=scatter_ap,
+                            )
+                        else:
+                            panel = make_panel(
+                                ri["data"][:n], ylabel=ri["name"],
+                                color=ri["color"] or "#1f77b4",
+                                height_ratio=spec.height_ratio,
+                                panel_type=spec.panel_type,
+                                addplot=ref_ap or None,
+                            )
                     else:
-                        panels.append(make_panel(
-                            first["data"][:n], ylabel=key,
-                            color=first["color"] or "#1f77b4",
-                            height_ratio=0.12,
-                            addplot=extra_ap or None,
-                        ))
+                        first = group_inds[0]
+                        extra_ap: list[dict[str, Any]] = []
+                        for ri in group_inds[1:]:
+                            ap_type = "scatter" if ri["scatter"] else "line"
+                            extra_ap.append(make_addplot(
+                                ri["data"][:n], type=ap_type,
+                                color=ri["color"], ylabel=ri["name"],
+                            ))
+                        extra_ap.extend(ref_ap)
+                        if first["scatter"]:
+                            extra_ap.insert(0, make_addplot(
+                                first["data"][:n], type="scatter",
+                                color=first["color"], ylabel=first["name"],
+                            ))
+                            panel = make_panel(
+                                np.full(n, np.nan), ylabel=key,
+                                color=first["color"], height_ratio=spec.height_ratio,
+                                panel_type=spec.panel_type, addplot=extra_ap,
+                            )
+                        else:
+                            panel = make_panel(
+                                first["data"][:n], ylabel=key,
+                                color=first["color"] or "#1f77b4",
+                                height_ratio=spec.height_ratio,
+                                panel_type=spec.panel_type,
+                                addplot=extra_ap or None,
+                            )
+                    panel.zero_centered = spec.zero_centered
+                    panels.append(panel)
+
+                else:
+                    # ---- No registry match: generic fallback --------------------------------
+                    if len(group_inds) == 1:
+                        ri = group_inds[0]
+                        if ri["scatter"]:
+                            panel_ap = [make_addplot(
+                                ri["data"][:n], type="scatter", color=ri["color"],
+                                ylabel=ri["name"],
+                            )]
+                            panels.append(make_panel(
+                                np.full(n, np.nan), ylabel=ri["name"],
+                                color=ri["color"], height_ratio=0.12,
+                                addplot=panel_ap,
+                            ))
+                        else:
+                            panels.append(make_panel(
+                                ri["data"][:n], ylabel=ri["name"],
+                                color=ri["color"] or "#1f77b4",
+                                height_ratio=0.12,
+                            ))
+                    else:
+                        # Multiple outputs → single panel with first as primary
+                        first = group_inds[0]
+                        extra_ap = []
+                        for ri in group_inds[1:]:
+                            ap_type = "scatter" if ri["scatter"] else "line"
+                            extra_ap.append(make_addplot(
+                                ri["data"][:n], type=ap_type,
+                                color=ri["color"], ylabel=ri["name"],
+                            ))
+                        if first["scatter"]:
+                            extra_ap.insert(0, make_addplot(
+                                first["data"][:n], type="scatter",
+                                color=first["color"], ylabel=first["name"],
+                            ))
+                            panels.append(make_panel(
+                                np.full(n, np.nan), ylabel=key,
+                                color=first["color"], height_ratio=0.12,
+                                addplot=extra_ap,
+                            ))
+                        else:
+                            panels.append(make_panel(
+                                first["data"][:n], ylabel=key,
+                                color=first["color"] or "#1f77b4",
+                                height_ratio=0.12,
+                                addplot=extra_ap or None,
+                            ))
 
         # --- initialise base widget -------------------------------------------
         show_vol = plot_volume and volumes is not None

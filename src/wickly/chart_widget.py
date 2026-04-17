@@ -655,6 +655,12 @@ class CandlestickWidget(QWidget):
             return rect.y() + rect.height() / 2
         return rect.y() + (1.0 - (price - lo) / (hi - lo)) * rect.height()
 
+    def _value_for_y(self, y: float, rect: QRectF, lo: float, hi: float) -> float:
+        """Inverse of ``_y_for_price``: pixel → data value."""
+        if rect.height() == 0:
+            return (lo + hi) / 2
+        return lo + (1.0 - (y - rect.y()) / rect.height()) * (hi - lo)
+
     def _y_for_volume(self, vol: float, rect: QRectF, vlo: float, vhi: float) -> float:
         if vhi == vlo:
             return rect.y() + rect.height()
@@ -810,10 +816,12 @@ class CandlestickWidget(QWidget):
         # ---- sub-panels -------------------------------------------------------
         agg_panels: list[SubPanel] = []
         for panel in saved["sub_panels"]:
-            if panel.skip_aggregation:
+            if panel.aggregation_method == "none":
                 agg_panels.append(panel)
                 continue
-            method = "sum" if panel.panel_type == "histogram" else "mean"
+            method = panel.aggregation_method or (
+                "sum" if panel.panel_type == "histogram" else "mean"
+            )
             agg_data = self._agg_1d(panel.data, factor, n, method)
             agg_paps: list[dict[str, Any]] = []
             for pap in panel.addplots:
@@ -852,10 +860,12 @@ class CandlestickWidget(QWidget):
                 visible=panel.visible,
                 addplots=agg_paps,
                 zero_centered=panel.zero_centered,
+                aggregation_method=panel.aggregation_method,
+                bar_color_mode=panel.bar_color_mode,
             ))
         self._sub_panels = agg_panels
 
-        # store original view info for skip_aggregation panels
+        # store original view info for panels with aggregation_method='none'
         self._agg_orig_view = (saved["view_start"], saved["view_end"],
                                saved["pan_offset"])
 
@@ -948,7 +958,7 @@ class CandlestickWidget(QWidget):
 
         # --- user sub-panels ----------------------------------------------------
         for panel, prect in zip(self._sub_panels, panel_rects):
-            if panel.skip_aggregation and self._agg_orig_view is not None:
+            if panel.aggregation_method == "none" and self._agg_orig_view is not None:
                 # Temporarily restore original view coords so _x_for_index
                 # maps segment indices correctly at full resolution.
                 orig_s, orig_e, orig_off = self._agg_orig_view
@@ -985,10 +995,9 @@ class CandlestickWidget(QWidget):
 
         # --- crosshair ----------------------------------------------------------
         if self._mouse_pos is not None:
-            all_rects = [main_rect] + ([vol_rect] if vol_rect else []) + [
-                r for r in panel_rects if r.height() > 0
-            ]
-            self._draw_crosshair(painter, main_rect, all_rects, s, e, plo, phi, style)
+            self._draw_crosshair(
+                painter, main_rect, vol_rect, panel_rects, s, e, plo, phi, style
+            )
 
         # --- legend -------------------------------------------------------------
         self._draw_legend(painter, main_rect, style)
@@ -1572,16 +1581,34 @@ class CandlestickWidget(QWidget):
         cw = self._candle_width(rect, count)
         zero_y = self._y_for_price(0.0, rect, lo, hi)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(color))
+
+        macd_mode = panel.bar_color_mode == "macd"
+        if macd_mode:
+            _c_pos_strong = _qcolor("#26a69a")   # positive, growing
+            _c_pos_weak   = _qcolor("#a3d9d5")   # positive, shrinking
+            _c_neg_strong = _qcolor("#ef5350")   # negative, growing (more negative)
+            _c_neg_weak   = _qcolor("#f4a7a7")   # negative, shrinking (less negative)
+
+        prev_val: float = float("nan")
         for i in range(s, e + 1):
             val = panel.data[i] if i < len(panel.data) else float("nan")
             if np.isnan(val):
+                prev_val = val
                 continue
+            if macd_mode:
+                if val >= 0:
+                    bar_color = _c_pos_strong if (np.isnan(prev_val) or val >= prev_val) else _c_pos_weak
+                else:
+                    bar_color = _c_neg_strong if (np.isnan(prev_val) or val <= prev_val) else _c_neg_weak
+                p.setBrush(QBrush(bar_color))
+            else:
+                p.setBrush(QBrush(color))
             x   = self._x_for_index(i, rect, s, e)
             y   = self._y_for_price(val, rect, lo, hi)
             top = min(y, zero_y)
             bh  = max(abs(y - zero_y), 1.0)
             p.drawRect(QRectF(x - cw / 2, top, cw, bh))
+            prev_val = val
 
     def _draw_addplot_list(
         self,
@@ -1630,11 +1657,97 @@ class CandlestickWidget(QWidget):
                     prev = pt
 
     # ---- crosshair ----
+
+    def _identify_hovered_panel(
+        self,
+        my: float,
+        main_rect: QRectF,
+        vol_rect: QRectF | None,
+        panel_rects: list[QRectF],
+    ) -> tuple[str, int]:
+        """Return ``(kind, index)`` for the panel whose Y range contains ``my``.
+
+        *kind* is one of ``'main'``, ``'volume'``, or ``'panel'``.
+        *index* is ``-1`` for *main* and *volume*, or the sub-panel index
+        for *panel*.
+        """
+        if main_rect.y() <= my < main_rect.y() + main_rect.height():
+            return ("main", -1)
+        if (vol_rect is not None and vol_rect.height() > 0
+                and vol_rect.y() <= my < vol_rect.y() + vol_rect.height()):
+            return ("volume", -1)
+        for pi, pr in enumerate(panel_rects):
+            if pr.height() > 0 and pr.y() <= my < pr.y() + pr.height():
+                return ("panel", pi)
+        return ("main", -1)  # fallback
+
+    def _build_crosshair_tip(
+        self,
+        idx: int,
+        panel_kind: str,
+        panel_idx: int,
+        cursor_value: float | None = None,
+    ) -> str:
+        """Build the tooltip string appropriate for the hovered panel.
+
+        *panel_kind* is one of ``'main'``, ``'volume'``, or ``'panel'``.
+        *panel_idx* is the sub-panel index when *panel_kind* is ``'panel'``.
+        *cursor_value* is the Y-axis value at the exact cursor pixel position.
+        """
+        parts: list[str] = []
+
+        # Date is shown in every panel
+        if self._dates is not None and idx < len(self._dates):
+            dt = self._dates[idx]
+            if hasattr(dt, "strftime"):
+                parts.append(dt.strftime("%Y-%m-%d"))
+
+        # Cursor Y value (actual position in panel coordinates)
+        if cursor_value is not None:
+            if panel_kind == "volume":
+                parts.append(f"@ {_format_number(cursor_value)}")
+            else:
+                parts.append(f"@ {cursor_value:,.2f}")
+
+        if panel_kind == "main":
+            parts += [
+                f"O {self._opens[idx]:,.2f}",
+                f"H {self._highs[idx]:,.2f}",
+                f"L {self._lows[idx]:,.2f}",
+                f"C {self._closes[idx]:,.2f}",
+            ]
+            if self._volumes is not None and idx < len(self._volumes):
+                parts.append(f"V {_format_number(self._volumes[idx])}")
+
+        elif panel_kind == "volume":
+            if self._volumes is not None and idx < len(self._volumes):
+                parts.append(f"Vol  {_format_number(self._volumes[idx])}")
+
+        elif panel_kind == "panel" and 0 <= panel_idx < len(self._sub_panels):
+            panel = self._sub_panels[panel_idx]
+            if idx < len(panel.data):
+                val = panel.data[idx]
+                if not np.isnan(val):
+                    parts.append(f"{panel.ylabel}  {val:,.4g}")
+            for ap in panel.addplots:
+                ylabel = ap.get("ylabel")
+                if not ylabel or ap["type"] == "segments":
+                    continue
+                ap_data = ap.get("data")
+                if ap_data is None or idx >= len(ap_data):
+                    continue
+                ap_val = ap_data[idx]
+                if not np.isnan(ap_val):
+                    parts.append(f"{ylabel}  {ap_val:,.4g}")
+
+        return "  |  ".join(parts)
+
     def _draw_crosshair(
         self,
         p: QPainter,
-        rect: QRectF,
-        all_rects: list[QRectF],
+        main_rect: QRectF,
+        vol_rect: QRectF | None,
+        panel_rects: list[QRectF],
         s: int,
         e: int,
         lo: float,
@@ -1644,35 +1757,49 @@ class CandlestickWidget(QWidget):
         mx = self._mouse_pos.x()  # type: ignore[union-attr]
         my = self._mouse_pos.y()  # type: ignore[union-attr]
 
+        all_rects = [main_rect] + ([vol_rect] if vol_rect else []) + [
+            r for r in panel_rects if r.height() > 0
+        ]
+        if not all_rects:
+            return
         full_top    = all_rects[0].y()
         full_bottom = all_rects[-1].y() + all_rects[-1].height()
 
-        if not (rect.x() <= mx <= rect.x() + rect.width() and full_top <= my <= full_bottom):
+        if not (main_rect.x() <= mx <= main_rect.x() + main_rect.width()
+                and full_top <= my <= full_bottom):
             return
 
         pen = QPen(_qcolor(style.get("text_color", "#333"), 0.4), 1, Qt.PenStyle.DashLine)
         p.setPen(pen)
-        p.drawLine(QPointF(rect.x(), my), QPointF(rect.x() + rect.width(), my))
+        p.drawLine(QPointF(main_rect.x(), my),
+                   QPointF(main_rect.x() + main_rect.width(), my))
         p.drawLine(QPointF(mx, full_top), QPointF(mx, full_bottom))
 
-        # index under cursor
-        idx = self._index_for_x(mx, rect, s, e)
+        # bar index under cursor
+        idx = self._index_for_x(mx, main_rect, s, e)
         idx = max(s, min(e, idx))
 
-        # tooltip
-        dt_str = ""
-        if self._dates is not None and hasattr(self._dates[idx], "strftime"):
-            dt_str = self._dates[idx].strftime("%Y-%m-%d")
-        parts = [
-            dt_str,
-            f"O {self._opens[idx]:,.2f}",
-            f"H {self._highs[idx]:,.2f}",
-            f"L {self._lows[idx]:,.2f}",
-            f"C {self._closes[idx]:,.2f}",
-        ]
-        if self._volumes is not None:
-            parts.append(f"V {_format_number(self._volumes[idx])}")
-        tip = "  |  ".join(parts)
+        # identify which panel the cursor is in
+        panel_kind, panel_idx = self._identify_hovered_panel(
+            my, main_rect, vol_rect, panel_rects
+        )
+
+        # compute cursor Y value in the hovered panel's coordinate space
+        cursor_value: float | None = None
+        if panel_kind == "main":
+            cursor_value = self._value_for_y(my, main_rect, lo, hi)
+        elif panel_kind == "volume" and vol_rect is not None:
+            vlo, vhi = self._volume_range(s, e)
+            cursor_value = self._value_for_y(my, vol_rect, vlo, vhi)
+        elif panel_kind == "panel" and 0 <= panel_idx < len(self._sub_panels):
+            pr = panel_rects[panel_idx]
+            yr = self._panel_y_range(self._sub_panels[panel_idx], s, e)
+            if yr is not None:
+                cursor_value = self._value_for_y(my, pr, yr[0], yr[1])
+
+        tip = self._build_crosshair_tip(idx, panel_kind, panel_idx, cursor_value)
+        if not tip:
+            return
 
         # draw label background
         font = QFont("Segoe UI", 8)
@@ -1681,8 +1808,8 @@ class CandlestickWidget(QWidget):
         tw = fm.horizontalAdvance(tip) + 12
         th = fm.height() + 6
 
-        label_x = min(mx + 14, rect.x() + rect.width() - tw - 4)
-        label_y = max(rect.y(), my - th - 6)
+        label_x = min(mx + 14, main_rect.x() + main_rect.width() - tw - 4)
+        label_y = max(full_top, my - th - 6)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(_qcolor("#222222", 0.85)))
         p.drawRoundedRect(QRectF(label_x, label_y, tw, th), 4, 4)
