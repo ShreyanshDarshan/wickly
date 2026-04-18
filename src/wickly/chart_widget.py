@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -11,13 +13,27 @@ from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QPen, QColor, QBrush, QFont, QFontMetrics,
     QWheelEvent, QMouseEvent, QPaintEvent, QResizeEvent, QPixmap,
-    QPolygonF,
+    QPolygonF, QPainterPath,
 )
 from PyQt6.QtWidgets import QWidget, QToolTip
 from PyQt6 import sip
 
-from wickly.addplot import SubPanel
+from wickly.addplot import SubPanel, make_addplot, make_panel
 from wickly.styles import _get_style, _MAV_COLORS
+
+
+@dataclass
+class _ActiveIndicator:
+    """Internal bookkeeping for one indicator added via the menu."""
+
+    uid: str                    # unique id
+    name: str                   # IndicatorSpec.name
+    display_label: str          # e.g. "RSI (14)"
+    params: dict[str, Any]
+    overlay: bool
+    # indices into widget's lists (for removal)
+    addplot_indices: list[int] = field(default_factory=list)
+    panel_index: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -148,14 +164,18 @@ class CandlestickWidget(QWidget):
 
         # legend interaction state (rebuilt each paint)
         self._legend_hover_idx:  int | None = None
-        self._legend_hit_areas:  list[tuple[QRectF, QRectF, str, int]] = []
-        self._legend_rect:       QRectF | None = None
+        self._legend_hit_areas:  list[tuple[QRectF, QRectF, QRectF | None, str, int]] = []
+        self._legend_rects:      list[QRectF] = []
 
         # panel resize drag state
         self._resizing_sep: int | None = None  # index into _separator_kinds
         self._resize_last_y: float = 0.0
         self._separator_kinds: list[tuple[str, int]] = []
         # Each entry: ("vol_top", -1), ("panel_top", panel_idx), etc.
+
+        # indicator menu state
+        self._active_indicators: list[_ActiveIndicator] = []
+        self._indicator_btn_rect: QRectF = QRectF()
 
         # appearance
         self.setMouseTracking(True)
@@ -196,6 +216,7 @@ class CandlestickWidget(QWidget):
         self._view_end   = max(self._n - 1, 0)
         self._pan_offset = 0.0
         self._recompute_mavs()
+        self._recompute_indicators()
         self._safe_update()
 
     def append_data(
@@ -420,6 +441,212 @@ class CandlestickWidget(QWidget):
         for period in self._mavs:
             ma = pd.Series(self._closes).rolling(period).mean().values
             self._mav_data.append(ma)
+
+    # ------------------------------------------------------------------
+    # Indicator menu integration
+    # ------------------------------------------------------------------
+
+    def add_indicator(self, name: str, **params: Any) -> str:
+        """Compute *name* from current OHLCV data and add it to the chart.
+
+        Returns the unique indicator id (used for ``remove_indicator``).
+        """
+        from wickly.indicators import get_indicator
+
+        spec = get_indicator(name)
+        merged = {ps.name: ps.default for ps in spec.params}
+        merged.update(params)
+
+        data = spec.compute(
+            self._closes, self._opens, self._highs, self._lows, self._volumes,
+            **merged,
+        )
+
+        # Build a human-readable label: "RSI (14)"
+        param_str = ", ".join(str(int(v) if isinstance(v, float) and v == int(v) else v)
+                              for v in merged.values())
+        label = spec.display_name + (f" ({param_str})" if param_str else "")
+
+        uid = uuid.uuid4().hex[:8]
+        ai = _ActiveIndicator(
+            uid=uid, name=name, display_label=label,
+            params=merged, overlay=spec.overlay,
+        )
+
+        if spec.overlay:
+            # Each output → one addplot overlay
+            for out in spec.outputs:
+                ap = make_addplot(
+                    data[out.key],
+                    type=out.plot_type,
+                    color=out.color,
+                    width=out.width,
+                    linestyle=out.linestyle,
+                    ylabel=out.label,
+                )
+                idx = len(self._addplots)
+                self._addplots.append(ap)
+                self._addplot_visible.append(True)
+                ai.addplot_indices.append(idx)
+        else:
+            # First output with plot_type == "histogram" → panel primary data;
+            # everything else → addplot overlays on the panel.
+            hist_out = next((o for o in spec.outputs if o.plot_type == "histogram"), None)
+            primary_out = hist_out if hist_out else spec.outputs[0]
+            panel_type = "histogram" if hist_out else "line"
+
+            sub_addplots: list[dict[str, Any]] = []
+            for out in spec.outputs:
+                if out.key == primary_out.key:
+                    continue
+                sub_addplots.append(make_addplot(
+                    data[out.key],
+                    type=out.plot_type if out.plot_type != "histogram" else "line",
+                    color=out.color,
+                    width=out.width,
+                    linestyle=out.linestyle,
+                    ylabel=out.label,
+                ))
+
+            # Add reference lines
+            for rl in spec.ref_lines:
+                sub_addplots.append(make_addplot(
+                    np.full(len(self._closes), rl),
+                    type="line",
+                    color="#888888",
+                    width=1.0,
+                    linestyle="--",
+                    alpha=0.5,
+                ))
+
+            panel = SubPanel(
+                data=data[primary_out.key],
+                ylabel=label,
+                height_ratio=spec.height_ratio,
+                color=primary_out.color,
+                panel_type=panel_type,
+                width=primary_out.width,
+                linestyle=primary_out.linestyle,
+                addplots=sub_addplots,
+                zero_centered=spec.zero_centered,
+                bar_color_mode="macd" if name == "MACD" and hist_out else None,
+            )
+            pi = self.add_panel(panel)
+            ai.panel_index = pi
+
+        self._active_indicators.append(ai)
+        self._safe_update()
+        return uid
+
+    def remove_indicator(self, indicator_id: str) -> None:
+        """Remove a previously-added indicator by its unique *indicator_id*."""
+        ai = next((a for a in self._active_indicators if a.uid == indicator_id), None)
+        if ai is None:
+            return
+
+        if ai.overlay:
+            # Remove addplots in reverse order so indices stay valid.
+            for idx in sorted(ai.addplot_indices, reverse=True):
+                if idx < len(self._addplots):
+                    del self._addplots[idx]
+                    del self._addplot_visible[idx]
+            # Adjust indices of other active indicators that reference higher addplot slots.
+            removed_set = set(ai.addplot_indices)
+            for other in self._active_indicators:
+                if other.uid == ai.uid or not other.overlay:
+                    continue
+                other.addplot_indices = [
+                    i - sum(1 for r in removed_set if r < i)
+                    for i in other.addplot_indices
+                ]
+        elif ai.panel_index is not None:
+            if ai.panel_index < len(self._sub_panels):
+                del self._sub_panels[ai.panel_index]
+            # Adjust panel indices of other active indicators.
+            for other in self._active_indicators:
+                if other.uid == ai.uid or other.panel_index is None:
+                    continue
+                if other.panel_index > ai.panel_index:
+                    other.panel_index -= 1
+
+        self._active_indicators = [a for a in self._active_indicators if a.uid != indicator_id]
+        self._safe_update()
+
+    def list_active_indicators(self) -> list[tuple[str, str, dict[str, Any]]]:
+        """Return ``[(uid, display_label, params), ...]`` for all active indicators."""
+        return [(a.uid, a.display_label, dict(a.params)) for a in self._active_indicators]
+
+    def _recompute_indicators(self) -> None:
+        """Recompute all active indicators after a data change."""
+        if not self._active_indicators:
+            return
+        from wickly.indicators import get_indicator
+
+        # Snapshot current active list and rebuild from scratch.
+        old = list(self._active_indicators)
+
+        # Remove all indicator-owned addplots/panels (reverse order).
+        for ai in reversed(old):
+            if ai.overlay:
+                for idx in sorted(ai.addplot_indices, reverse=True):
+                    if idx < len(self._addplots):
+                        del self._addplots[idx]
+                        del self._addplot_visible[idx]
+            elif ai.panel_index is not None:
+                if ai.panel_index < len(self._sub_panels):
+                    del self._sub_panels[ai.panel_index]
+
+        self._active_indicators.clear()
+
+        # Re-add each indicator with same params.
+        for ai in old:
+            self.add_indicator(ai.name, **ai.params)
+
+    def _open_indicator_dialog(self) -> None:
+        """Open the indicator search dialog."""
+        from wickly._indicator_dialog import IndicatorSearchDialog
+
+        dlg = IndicatorSearchDialog(
+            self,
+            style=self._style,
+            active_indicators=self.list_active_indicators(),
+        )
+        dlg.indicatorAdded.connect(self._on_indicator_added)
+        dlg.indicatorRemoved.connect(self._on_indicator_removed)
+        dlg.exec()
+
+    def _on_indicator_added(self, name: str, params: dict) -> None:
+        self.add_indicator(name, **params)
+
+    def _on_indicator_removed(self, indicator_id: str) -> None:
+        self.remove_indicator(indicator_id)
+
+    def _draw_indicator_button(self, painter: QPainter, main_rect: QRectF, style: dict) -> None:
+        """Draw an ƒx indicator button in the top-right area of the chart."""
+        text_color = style.get("text_color", "#333")
+        btn_w, btn_h = 32.0, 22.0
+        bx = main_rect.right() - btn_w - 4
+        by = 8.0
+        self._indicator_btn_rect = QRectF(bx, by, btn_w, btn_h)
+
+        # button background
+        bg = QColor(style.get("bg_color", "#ffffff"))
+        bg.setAlphaF(0.85)
+        painter.setPen(QPen(_qcolor(style.get("grid_color", "#e0e0e0"), 0.7), 1))
+        painter.setBrush(QBrush(bg))
+        painter.drawRoundedRect(self._indicator_btn_rect, 4, 4)
+
+        # "ƒx" label
+        font = QFont("Segoe UI", 9)
+        font.setItalic(True)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QPen(_qcolor(text_color)))
+        painter.drawText(
+            self._indicator_btn_rect,
+            Qt.AlignmentFlag.AlignCenter,
+            "ƒx",
+        )
 
     def reset_view(self) -> None:
         self._view_start = 0
@@ -993,6 +1220,9 @@ class CandlestickWidget(QWidget):
                 self._title,
             )
 
+        # --- indicator button ---------------------------------------------------
+        self._draw_indicator_button(painter, main_rect, style)
+
         # --- crosshair ----------------------------------------------------------
         if self._mouse_pos is not None:
             self._draw_crosshair(
@@ -1000,7 +1230,7 @@ class CandlestickWidget(QWidget):
             )
 
         # --- legend -------------------------------------------------------------
-        self._draw_legend(painter, main_rect, style)
+        self._draw_legend(painter, main_rect, vol_rect, panel_rects, style)
 
     # ---- legend ----
 
@@ -1024,66 +1254,101 @@ class CandlestickWidget(QWidget):
             for tx in (cx - hw * 0.5, cx, cx + hw * 0.5):
                 p.drawLine(QPointF(tx, cy), QPointF(tx, cy + tick))
 
-    def _draw_legend(self, p: QPainter, rect: QRectF, style: dict) -> None:
-        """Draw a vertical legend with per-series eye-icon visibility toggles."""
-        # --- build entry list: (color, label, pen_style, kind, kind_idx, visible) ---
-        entries: list[tuple[QColor, str, Qt.PenStyle, str, int, bool]] = []
+    def _draw_legend(self, p: QPainter, main_rect: QRectF,
+                     vol_rect: QRectF | None,
+                     panel_rects: list[QRectF],
+                     style: dict) -> None:
+        """Draw per-panel legends with eye-icon toggles and trash-icon delete."""
+        self._legend_hit_areas = []
+        self._legend_rects = []
+        # Track cumulative y offset per panel so multiple legend boxes don't overlap
+        self._legend_y_offsets: dict[int, float] = {}
 
         mav_colors = style.get("mavcolors", _MAV_COLORS)
+
+        # --- helpers to resolve linestyle to Qt pen style ---
+        def _pen_style(ls: str) -> Qt.PenStyle:
+            if ls in ("--", "dashed"):
+                return Qt.PenStyle.DashLine
+            if ls in ("-.", "dashdot"):
+                return Qt.PenStyle.DashDotLine
+            if ls in (":", "dotted"):
+                return Qt.PenStyle.DotLine
+            return Qt.PenStyle.SolidLine
+
+        # --- 1) main-chart legend: MAVs + overlay addplots ---
+        main_entries: list[tuple[QColor, str, Qt.PenStyle, str, int, bool, bool]] = []
         for idx, period in enumerate(self._mavs):
-            entries.append((
+            main_entries.append((
                 _qcolor(mav_colors[idx % len(mav_colors)]),
                 f"MA {period}",
                 Qt.PenStyle.SolidLine,
                 "mav", idx,
                 self._mav_visible[idx],
+                False,  # not deletable
             ))
-
         for ap_idx, ap in enumerate(self._addplots):
             label = ap.get("ylabel")
             if not label:
                 continue
             color = _qcolor(ap.get("color") or "#1f77b4", ap.get("alpha", 1.0))
-            ls = ap.get("linestyle", "-")
-            if ls in ("--", "dashed"):
-                ps = Qt.PenStyle.DashLine
-            elif ls in ("-.", "dashdot"):
-                ps = Qt.PenStyle.DashDotLine
-            elif ls in (":", "dotted"):
-                ps = Qt.PenStyle.DotLine
-            else:
-                ps = Qt.PenStyle.SolidLine
-            entries.append((color, label, ps, "addplot", ap_idx,
-                            self._addplot_visible[ap_idx]))
+            ps = _pen_style(ap.get("linestyle", "-"))
+            main_entries.append((color, label, ps, "addplot", ap_idx,
+                                 self._addplot_visible[ap_idx], True))
 
+        if main_entries:
+            self._draw_legend_box(p, main_entries, main_rect, style)
+
+        # --- 2) volume legend ---
         if self._show_volume:
             vol_color = _qcolor(
                 style.get("volume_up", style.get("up_color", "#26a69a")), 0.7
             )
-            entries.append((vol_color, "Volume", Qt.PenStyle.SolidLine,
-                            "volume", 0, self._volume_visible))
+            vol_entries: list[tuple[QColor, str, Qt.PenStyle, str, int, bool, bool]] = [
+                (vol_color, "Volume", Qt.PenStyle.SolidLine,
+                 "volume", 0, self._volume_visible, False),
+            ]
+            # Show in volume panel if visible, otherwise in main chart
+            vol_legend_rect = vol_rect if (vol_rect is not None and vol_rect.height() > 0) else main_rect
+            self._draw_legend_box(p, vol_entries, vol_legend_rect, style)
 
-        # Collect sub-panel entries
-        for pi, panel in enumerate(self._sub_panels):
-            entries.append((
+        # --- 3) sub-panel legends ---
+        # Hidden panels get their legend shown in the main chart.
+        for pi, (panel, prect) in enumerate(zip(self._sub_panels, panel_rects)):
+            entry = (
                 _qcolor(panel.color, panel.alpha),
                 panel.ylabel,
                 Qt.PenStyle.SolidLine,
                 "panel", pi,
                 panel.visible,
-            ))
+                True,  # deletable
+            )
+            legend_rect = prect if prect.height() >= 1 else main_rect
+            self._draw_legend_box(p, [entry], legend_rect, style)
 
+    # ---- legend box helper ----
+
+    def _draw_legend_box(
+        self,
+        p: QPainter,
+        entries: list[tuple[QColor, str, Qt.PenStyle, str, int, bool, bool]],
+        rect: QRectF,
+        style: dict,
+    ) -> None:
+        """Draw a compact legend box inside *rect*.
+
+        Each entry is ``(color, label, pen_style, kind, kind_idx, visible, deletable)``.
+        Appends to ``self._legend_hit_areas`` and ``self._legend_rects``.
+        """
         if not entries:
-            self._legend_rect = None
-            self._legend_hit_areas = []
             return
 
-        # --- layout constants ---------------------------------------------------
         font = QFont("Segoe UI", 8)
         p.setFont(font)
         fm = QFontMetrics(font)
 
         eye_sz   = 10.0
+        trash_sz = 10.0
         swatch_w = 18.0
         gap      = 5.0
         pad_x    = 8.0
@@ -1091,26 +1356,32 @@ class CandlestickWidget(QWidget):
         row_h    = max(float(fm.height()), eye_sz) + 4.0
         row_gap  = 2.0
 
-        max_lw  = max(fm.horizontalAdvance(e[1]) for e in entries)
-        total_w = pad_x * 2 + eye_sz + gap + swatch_w + gap + max_lw
+        has_trash = any(e[6] for e in entries)
+        max_lw   = max(fm.horizontalAdvance(e[1]) for e in entries)
+        total_w  = pad_x * 2 + eye_sz + gap + swatch_w + gap + max_lw
+        if has_trash:
+            total_w += gap + trash_sz
         total_h = pad_y * 2 + len(entries) * row_h + max(0, len(entries) - 1) * row_gap
 
         box_x = rect.x() + 4.0
-        box_y = rect.y() + 4.0
+        rect_id = id(rect)
+        y_off = self._legend_y_offsets.get(rect_id, 0.0)
+        box_y = rect.y() + 4.0 + y_off
 
-        # --- background box -----------------------------------------------------
+        # background box
         p.setPen(QPen(_qcolor(style.get("grid_color", "#e0e0e0"), 0.60), 1))
         p.setBrush(QBrush(_qcolor(style.get("bg_color", "#ffffff"), 0.88)))
         legend_rect = QRectF(box_x, box_y, total_w, total_h)
         p.drawRoundedRect(legend_rect, 4, 4)
-        self._legend_rect      = legend_rect
-        self._legend_hit_areas = []
+        self._legend_rects.append(legend_rect)
+        self._legend_y_offsets[rect_id] = y_off + total_h + 4.0
 
         text_color = _qcolor(style.get("text_color", "#333"))
         hover_fill = _qcolor(style.get("text_color", "#333"), 0.07)
 
-        # --- draw rows ----------------------------------------------------------
-        for row_idx, (color, label, pen_style, kind, kind_idx, visible) in enumerate(entries):
+        global_start = len(self._legend_hit_areas)
+
+        for row_idx, (color, label, pen_style, kind, kind_idx, visible, deletable) in enumerate(entries):
             row_y = box_y + pad_y + row_idx * (row_h + row_gap)
             cy    = row_y + row_h / 2.0
 
@@ -1118,7 +1389,7 @@ class CandlestickWidget(QWidget):
             eye_rect = QRectF(box_x + pad_x, cy - eye_sz / 2, eye_sz, eye_sz)
 
             # row hover highlight
-            if row_idx == self._legend_hover_idx:
+            if (global_start + row_idx) == self._legend_hover_idx:
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QBrush(hover_fill))
                 p.drawRoundedRect(row_rect, 3, 3)
@@ -1147,7 +1418,79 @@ class CandlestickWidget(QWidget):
             p.setPen(QPen(lc))
             p.drawText(QPointF(cx, cy + fm.ascent() / 2.0 - 1), label)
 
-            self._legend_hit_areas.append((row_rect, eye_rect, kind, kind_idx))
+            # trash icon
+            trash_rect: QRectF | None = None
+            if deletable:
+                tx = box_x + total_w - pad_x - trash_sz
+                trash_rect = QRectF(tx, cy - trash_sz / 2, trash_sz, trash_sz)
+                trash_c = QColor(text_color)
+                trash_c.setAlphaF(0.45)
+                self._draw_trash_icon(p, tx + trash_sz / 2, cy, trash_sz, trash_c)
+
+            self._legend_hit_areas.append((row_rect, eye_rect, trash_rect, kind, kind_idx))
+
+    # ---- trash icon ----
+
+    def _draw_trash_icon(self, p: QPainter, cx: float, cy: float,
+                         size: float, color: QColor) -> None:
+        """Draw a small trash-can icon centred at (cx, cy)."""
+        p.setPen(QPen(color, 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        hw = size * 0.35
+        hh = size * 0.42
+        # can body
+        p.drawRect(QRectF(cx - hw, cy - hh * 0.4, hw * 2, hh * 1.4))
+        # lid
+        p.drawLine(QPointF(cx - hw - 1, cy - hh * 0.4),
+                   QPointF(cx + hw + 1, cy - hh * 0.4))
+        # handle
+        p.drawLine(QPointF(cx - hw * 0.35, cy - hh * 0.4),
+                   QPointF(cx - hw * 0.35, cy - hh * 0.65))
+        p.drawLine(QPointF(cx - hw * 0.35, cy - hh * 0.65),
+                   QPointF(cx + hw * 0.35, cy - hh * 0.65))
+        p.drawLine(QPointF(cx + hw * 0.35, cy - hh * 0.65),
+                   QPointF(cx + hw * 0.35, cy - hh * 0.4))
+
+    # ---- legend delete ----
+
+    def _delete_legend_item(self, kind: str, kind_idx: int) -> None:
+        """Delete an overlay or sub-panel from the chart (trash-icon handler).
+
+        For indicator-owned items, delegates to ``remove_indicator``.
+        For manually-added addplots/panels, removes directly.
+        """
+        if kind == "addplot":
+            # Check if this addplot belongs to an active indicator.
+            for ai in self._active_indicators:
+                if ai.overlay and kind_idx in ai.addplot_indices:
+                    self.remove_indicator(ai.uid)
+                    return
+            # Not indicator-owned: remove the addplot directly.
+            if kind_idx < len(self._addplots):
+                del self._addplots[kind_idx]
+                del self._addplot_visible[kind_idx]
+                # Fix up indicator addplot indices.
+                for ai in self._active_indicators:
+                    if ai.overlay:
+                        ai.addplot_indices = [
+                            i - 1 if i > kind_idx else i
+                            for i in ai.addplot_indices
+                        ]
+            self._safe_update()
+
+        elif kind == "panel":
+            # Check if this panel belongs to an active indicator.
+            for ai in self._active_indicators:
+                if ai.panel_index == kind_idx:
+                    self.remove_indicator(ai.uid)
+                    return
+            # Not indicator-owned: remove the panel directly.
+            if kind_idx < len(self._sub_panels):
+                del self._sub_panels[kind_idx]
+                for ai in self._active_indicators:
+                    if ai.panel_index is not None and ai.panel_index > kind_idx:
+                        ai.panel_index -= 1
+            self._safe_update()
 
     # ---- grid ----
     def _draw_grid(self, p: QPainter, rect: QRectF, lo: float, hi: float, style: dict) -> None:
@@ -1853,8 +2196,16 @@ class CandlestickWidget(QWidget):
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             pos = event.position()
+            # --- indicator button click ---
+            if self._indicator_btn_rect.contains(pos):
+                self._open_indicator_dialog()
+                return
             # --- legend eye-icon click: toggle visibility, suppress drag ---
-            for row_rect, eye_rect, kind, kind_idx in self._legend_hit_areas:
+            # --- legend trash-icon click: delete item ---
+            for row_rect, eye_rect, trash_rect, kind, kind_idx in self._legend_hit_areas:
+                if trash_rect is not None and trash_rect.contains(pos):
+                    self._delete_legend_item(kind, kind_idx)
+                    return
                 if eye_rect.contains(pos):
                     if kind == "mav":
                         self._mav_visible[kind_idx] = not self._mav_visible[kind_idx]
@@ -1975,9 +2326,10 @@ class CandlestickWidget(QWidget):
             return
 
         # --- legend hover ---
-        if self._legend_rect is not None and self._legend_rect.contains(pos):
+        in_legend = any(lr.contains(pos) for lr in self._legend_rects)
+        if in_legend:
             self._legend_hover_idx = None
-            for row_idx, (row_rect, eye_rect, kind, kind_idx) in enumerate(self._legend_hit_areas):
+            for row_idx, (row_rect, eye_rect, trash_rect, kind, kind_idx) in enumerate(self._legend_hit_areas):
                 if row_rect.contains(pos):
                     self._legend_hover_idx = row_idx
                     break

@@ -12,10 +12,20 @@ from wickly.plotting import plot, live_plot
 from wickly.addplot import make_addplot, make_segments, make_panel, SubPanel
 from wickly.styles import make_style, available_styles
 from wickly import bt
+from wickly import indicators
+from wickly.indicators import (
+    register_indicator,
+    get_indicator,
+    list_indicators,
+    IndicatorSpec,
+    ParamSpec,
+    OutputSpec,
+)
 
 __all__ = [
     "__version__",
     "bt",
+    "indicators",
     "plot",
     "live_plot",
     "make_addplot",
@@ -24,4 +34,10 @@ __all__ = [
     "SubPanel",
     "make_style",
     "available_styles",
+    "register_indicator",
+    "get_indicator",
+    "list_indicators",
+    "IndicatorSpec",
+    "ParamSpec",
+    "OutputSpec",
 ]
